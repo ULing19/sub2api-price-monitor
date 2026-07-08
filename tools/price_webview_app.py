@@ -539,7 +539,7 @@ CONTROL_HTML = r"""<!doctype html>
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Sub2API 价格抓取</title>
+  <title>Sub2API 中转站比价</title>
   <style>
     * { box-sizing: border-box; }
     body {
@@ -727,7 +727,7 @@ CONTROL_HTML = r"""<!doctype html>
   <main class="app">
     <header>
       <div>
-        <h1>Sub2API 价格抓取</h1>
+        <h1>Sub2API 中转站比价</h1>
         <div class="status" id="status">等待登录</div>
       </div>
       <div class="status" id="rowCount">0 行</div>
@@ -1922,7 +1922,7 @@ class PriceAppApi:
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Sub2API price scraping desktop app")
+    parser = argparse.ArgumentParser(description="Sub2API relay price comparison desktop app")
     parser.add_argument("--site", default="", help="optional target site URL")
     parser.add_argument("--devtools", action="store_true", help="open control-window debug mode")
     return parser.parse_args()
@@ -1934,7 +1934,7 @@ def main():
     api = PriceAppApi(site)
 
     controller = webview.create_window(
-        "Sub2API 价格抓取",
+        "Sub2API 中转站比价",
         html=CONTROL_HTML,
         js_api=api,
         width=980,
