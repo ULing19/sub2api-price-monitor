@@ -1,0 +1,31 @@
+# Build outputs
+dist/
+build/
+*.spec
+*.exe
+
+# Runtime data and private site/login state
+output/
+price-sites.json
+price-latest.json
+price-latest.csv
+price-history/
+price-webview-profile/
+chrome-profiles/
+edge-profiles/
+price-login-profiles/
+
+# Python and local environment
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.env
+.env.*
+
+# Logs and OS/editor noise
+*.log
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
