@@ -185,7 +185,7 @@ def schedule_next_run(record, from_time=None):
 def normalize_saved_site_record(item):
     record = dict(item)
     site = str(record.get("site") or "")
-    record["name"] = site
+    record["name"] = str(record.get("name") or site)
     record["auto_refresh"] = True
     if site and not record.get("next_run"):
         record["next_run"] = next_run_at(record).isoformat()
@@ -281,6 +281,51 @@ def row_sort_key(row):
         row.get("record_type", ""),
         row.get("plan_name", ""),
     )
+
+
+def row_price(row):
+    for key in ("pay_price_cny", "price"):
+        try:
+            value = float(str(row.get(key) or "").replace(",", ""))
+            if value >= 0:
+                return value
+        except ValueError:
+            continue
+    return float("inf")
+
+
+def row_identity_key(row):
+    site = row.get("site_host") or urlparse(str(row.get("site") or "")).netloc or row.get("site") or ""
+    return tuple(
+        str(value or "").strip().lower()
+        for value in (
+            site,
+            row.get("record_type"),
+            row.get("model_category"),
+            row.get("group_id") or row.get("group_name"),
+            row.get("group_platform"),
+            row.get("plan_id") or row.get("plan_name") or row.get("description"),
+        )
+    )
+
+
+def row_timestamp(row):
+    parsed = parse_datetime(row.get("fetched_at"))
+    return parsed or datetime.min.replace(tzinfo=timezone.utc)
+
+
+def merge_price_rows(previous_rows, fresh_rows):
+    merged = {}
+    for row in list(previous_rows or []) + list(fresh_rows or []):
+        if not isinstance(row, dict):
+            continue
+        key = row_identity_key(row)
+        current = merged.get(key)
+        if current is None or row_timestamp(row) >= row_timestamp(current):
+            merged[key] = row
+    rows = list(merged.values())
+    rows.sort(key=lambda row: (row_price(row), row_rate(row), row_sort_key(row)))
+    return rows
 
 
 COLLECTOR_JS = r"""
@@ -526,7 +571,7 @@ CONTROL_HTML = r"""<!doctype html>
     }
     .field-wide { grid-column: span 2; }
     label { display: grid; gap: 5px; color: #5b6877; font-size: 12px; font-weight: 650; }
-    input[type="url"], input[type="text"], input[type="number"], select {
+    input[type="url"], input[type="text"], input[type="number"], input[type="search"], select {
       width: 100%;
       height: 36px;
       border: 1px solid #cbd5e1;
@@ -567,14 +612,36 @@ CONTROL_HTML = r"""<!doctype html>
     .content {
       min-height: 0;
       display: grid;
-      grid-template-rows: auto 1fr 152px;
+      grid-template-rows: auto auto auto 1fr 152px;
       gap: 12px;
       padding: 14px 18px 18px;
+    }
+    .tabs {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+    .tab-button {
+      height: 32px;
+      border-radius: 999px;
+      padding: 0 14px;
+      font-size: 12px;
+    }
+    .tab-button.active {
+      border-color: #1f6feb;
+      background: #1f6feb;
+      color: #fff;
     }
     .category-strip {
       display: grid;
       grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
       gap: 10px;
+    }
+    .filter-bar {
+      display: grid;
+      grid-template-columns: minmax(220px, 2fr) repeat(4, minmax(120px, 1fr));
+      gap: 10px;
+      align-items: end;
     }
     .category-card {
       border: 1px solid #dfe5ec;
@@ -651,6 +718,7 @@ CONTROL_HTML = r"""<!doctype html>
     }
     @media (max-width: 980px) {
       .controls { grid-template-columns: 1fr 1fr; }
+      .filter-bar { grid-template-columns: 1fr 1fr; }
       .summary { grid-template-columns: 1fr; }
     }
   </style>
@@ -680,7 +748,7 @@ CONTROL_HTML = r"""<!doctype html>
       </label>
       <label>
         保存备注
-        <input id="siteNameInput" type="text" spellcheck="false" placeholder="自动使用站点地址" readonly />
+        <input id="siteNameInput" type="text" spellcheck="false" placeholder="默认使用站点地址，可自行备注" />
       </label>
       <label>
         间隔(小时)
@@ -707,7 +775,35 @@ CONTROL_HTML = r"""<!doctype html>
     </section>
 
     <section class="content">
+      <div class="tabs" id="categoryTabs"></div>
       <div class="category-strip" id="categoryStrip"></div>
+      <div class="filter-bar">
+        <label>
+          搜索
+          <input id="filterInput" type="search" spellcheck="false" placeholder="站点、分组、套餐、平台" />
+        </label>
+        <label>
+          站点
+          <select id="siteFilterSelect"></select>
+        </label>
+        <label>
+          类型
+          <select id="typeFilterSelect">
+            <option value="">全部</option>
+            <option value="plan">套餐</option>
+            <option value="group">分组</option>
+            <option value="error">错误</option>
+          </select>
+        </label>
+        <label>
+          最高倍率
+          <input id="maxRateInput" type="number" min="0" step="0.01" placeholder="不限" />
+        </label>
+        <label class="toggle">
+          <input id="priceOnlyInput" type="checkbox" />
+          只看有价格/倍率
+        </label>
+      </div>
       <div class="table-wrap">
         <table>
           <thead>
@@ -759,6 +855,12 @@ CONTROL_HTML = r"""<!doctype html>
     const logBox = document.querySelector('#logBox');
     const consoleStatus = document.querySelector('#consoleStatus');
     const categoryStrip = document.querySelector('#categoryStrip');
+    const categoryTabs = document.querySelector('#categoryTabs');
+    const filterInput = document.querySelector('#filterInput');
+    const siteFilterSelect = document.querySelector('#siteFilterSelect');
+    const typeFilterSelect = document.querySelector('#typeFilterSelect');
+    const maxRateInput = document.querySelector('#maxRateInput');
+    const priceOnlyInput = document.querySelector('#priceOnlyInput');
     const rowCount = document.querySelector('#rowCount');
     const planCount = document.querySelector('#planCount');
     const groupCount = document.querySelector('#groupCount');
@@ -766,13 +868,17 @@ CONTROL_HTML = r"""<!doctype html>
     let rows = [];
     let savedSites = [];
     let latestGeneratedAt = '';
+    let activeCategory = '';
+    let loginAutoCaptureTimer = null;
+    let loginAutoCaptureBusy = false;
+    let lastAutoCaptureError = '';
+    let noteTouched = false;
+    let lastAutoNote = '';
     const CATEGORY_ORDER = [
       'OpenAI',
       'Anthropic',
       'Gemini',
       'Grok',
-      '其他',
-      '未获取',
     ];
 
     function escapeHtml(value) {
@@ -850,25 +956,140 @@ CONTROL_HTML = r"""<!doctype html>
       });
     }
 
-    function renderCategoryStrip() {
+    function priceSortValue(row) {
+      const price = numericPrice(row);
+      return price === null ? Number.POSITIVE_INFINITY : price;
+    }
+
+    function recordTypeLabel(type) {
+      if (type === 'plan') return '套餐';
+      if (type === 'group') return '分组';
+      if (type === 'error') return '错误';
+      return type || '';
+    }
+
+    function rowSiteValue(row) {
+      return row.site_host || row.site || '';
+    }
+
+    function rowHasPriceOrRate(row) {
+      return numericPrice(row) !== null || Number.isFinite(numericRate(row));
+    }
+
+    function rowSearchText(row) {
+      return [
+        row.site,
+        row.site_host,
+        row.record_type,
+        row.model_category,
+        row.model_names,
+        row.group_id,
+        row.group_name,
+        row.group_platform,
+        row.plan_id,
+        row.plan_name,
+        row.price,
+        row.pay_price_cny,
+        row.rate_multiplier,
+        row.description,
+        row.error,
+      ].map((value) => String(value ?? '').toLowerCase()).join(' ');
+    }
+
+    function compareDisplayRows(a, b) {
+      if (activeCategory) {
+        return compareRate(a, b)
+          || priceSortValue(a) - priceSortValue(b)
+          || rowSiteValue(a).localeCompare(rowSiteValue(b), 'zh-CN')
+          || groupLabel(a).localeCompare(groupLabel(b), 'zh-CN')
+          || String(a.group_platform || '').localeCompare(String(b.group_platform || ''), 'zh-CN')
+          || String(a.record_type || '').localeCompare(String(b.record_type || ''), 'zh-CN')
+          || String(a.plan_name || '').localeCompare(String(b.plan_name || ''), 'zh-CN');
+      }
+      return priceSortValue(a) - priceSortValue(b)
+        || compareRate(a, b)
+        || categoryRank(a.model_category) - categoryRank(b.model_category)
+        || String(a.model_category || '').localeCompare(String(b.model_category || ''), 'zh-CN')
+        || rowSiteValue(a).localeCompare(rowSiteValue(b), 'zh-CN')
+        || groupLabel(a).localeCompare(groupLabel(b), 'zh-CN')
+        || String(a.group_platform || '').localeCompare(String(b.group_platform || ''), 'zh-CN')
+        || String(a.record_type || '').localeCompare(String(b.record_type || ''), 'zh-CN')
+        || String(a.plan_name || '').localeCompare(String(b.plan_name || ''), 'zh-CN');
+    }
+
+    function getFilteredRows() {
+      const query = filterInput.value.trim().toLowerCase();
+      const selectedSite = siteFilterSelect.value;
+      const selectedType = typeFilterSelect.value;
+      const maxRate = maxRateInput.value === '' ? null : Number(maxRateInput.value);
+      return rows.filter((row) => {
+        if (activeCategory && row.model_category !== activeCategory) return false;
+        if (selectedSite && rowSiteValue(row) !== selectedSite) return false;
+        if (selectedType && row.record_type !== selectedType) return false;
+        if (priceOnlyInput.checked && !rowHasPriceOrRate(row)) return false;
+        if (Number.isFinite(maxRate)) {
+          const rate = numericRate(row);
+          if (!Number.isFinite(rate) || rate > maxRate) return false;
+        }
+        if (query && !rowSearchText(row).includes(query)) return false;
+        return true;
+      }).sort(compareDisplayRows);
+    }
+
+    function renderCategoryTabs() {
+      const tabs = [
+        { value: '', label: '全部', count: rows.length },
+        ...CATEGORY_ORDER.map((category) => ({
+          value: category,
+          label: category,
+          count: rows.filter((row) => row.model_category === category).length,
+        })),
+      ];
+      categoryTabs.innerHTML = tabs.map((tab) => {
+        const active = tab.value === activeCategory ? ' active' : '';
+        return `<button class="tab-button${active}" type="button" data-category="${escapeHtml(tab.value)}">${escapeHtml(tab.label)} ${tab.count}</button>`;
+      }).join('');
+      for (const button of categoryTabs.querySelectorAll('button')) {
+        button.addEventListener('click', () => {
+          activeCategory = button.dataset.category || '';
+          render();
+        });
+      }
+    }
+
+    function renderSiteFilterOptions() {
+      const selected = siteFilterSelect.value;
+      const sites = [...new Set(rows.map(rowSiteValue).filter(Boolean))]
+        .sort((a, b) => a.localeCompare(b, 'zh-CN'));
+      siteFilterSelect.innerHTML = '<option value="">全部站点</option>' + sites.map((site) => (
+        `<option value="${escapeHtml(site)}">${escapeHtml(site)}</option>`
+      )).join('');
+      if (sites.includes(selected)) siteFilterSelect.value = selected;
+    }
+
+    function renderCategoryStrip(sourceRows) {
       const stats = new Map();
-      for (const row of rows) {
+      for (const row of sourceRows) {
         const category = row.model_category || '其他';
-        const current = stats.get(category) || { plans: 0, groups: 0, min: null, sites: new Set() };
+        if (!CATEGORY_ORDER.includes(category)) continue;
+        const current = stats.get(category) || { plans: 0, groups: 0, minPrice: null, minRate: null, sites: new Set() };
         if (row.record_type === 'plan') current.plans += 1;
         if (row.record_type === 'group') current.groups += 1;
         if (row.site_host) current.sites.add(row.site_host);
         const price = numericPrice(row);
-        if (price !== null && (current.min === null || price < current.min)) current.min = price;
+        if (price !== null && (current.minPrice === null || price < current.minPrice)) current.minPrice = price;
+        const rate = numericRate(row);
+        if (Number.isFinite(rate) && (current.minRate === null || rate < current.minRate)) current.minRate = rate;
         stats.set(category, current);
       }
       const cards = [...stats.entries()]
         .sort((a, b) => categoryRank(a[0]) - categoryRank(b[0]) || a[0].localeCompare(b[0], 'zh-CN'))
         .map(([category, stat]) => {
-          const minText = stat.min === null ? '暂无价格' : `最低 ${stat.min}`;
+          const priceText = stat.minPrice === null ? '暂无价格' : `最低价 ${stat.minPrice}`;
+          const rateText = stat.minRate === null ? '暂无倍率' : `最低倍率 ${stat.minRate}`;
           return `<div class="category-card">
             <strong>${escapeHtml(category)}</strong>
-            <span>${stat.sites.size} 站 · ${stat.plans} 套餐 · ${stat.groups} 分组 · ${escapeHtml(minText)}</span>
+            <span>${stat.sites.size} 站 · ${stat.plans} 套餐 · ${stat.groups} 分组 · ${escapeHtml(rateText)} · ${escapeHtml(priceText)}</span>
           </div>`;
         });
       categoryStrip.innerHTML = cards.length ? cards.join('') : '';
@@ -879,56 +1100,49 @@ CONTROL_HTML = r"""<!doctype html>
         const interval = site.interval_minutes ? ` · ${Math.round(site.interval_minutes / 60 * 100) / 100}h` : '';
         const next = site.next_run ? ` · 下次 ${formatDateTime(site.next_run)}` : '';
         const status = site.last_status ? ` · ${site.last_status}` : '';
-        const label = `${site.site}${interval}${next}${status}`;
+        const name = site.name && site.name !== site.site ? `${site.name} · ${site.site}` : site.site;
+        const label = `${name}${interval}${next}${status}`;
         return `<option value="${escapeHtml(site.site)}">${escapeHtml(label)}</option>`;
       }).join('');
     }
 
     function render() {
-      const plans = rows.filter((row) => row.record_type === 'plan');
-      const groups = rows.filter((row) => row.record_type === 'group');
-      const categories = new Set(rows.map((row) => row.model_category).filter(Boolean));
+      renderCategoryTabs();
+      renderSiteFilterOptions();
+      const displayRows = getFilteredRows();
+      const plans = displayRows.filter((row) => row.record_type === 'plan');
+      const groups = displayRows.filter((row) => row.record_type === 'group');
+      const categories = new Set(displayRows.map((row) => row.model_category).filter((category) => CATEGORY_ORDER.includes(category)));
       planCount.textContent = String(plans.length);
       groupCount.textContent = String(groups.length);
       categoryCount.textContent = String(categories.size);
-      rowCount.textContent = `${rows.length} 行`;
+      rowCount.textContent = `${displayRows.length}/${rows.length} 行`;
       exportCsvBtn.disabled = rows.length === 0;
       exportJsonBtn.disabled = rows.length === 0;
-      renderCategoryStrip();
+      renderCategoryStrip(displayRows);
 
       if (!rows.length) {
         resultBody.innerHTML = '<tr><td colspan="10" class="empty">暂无数据</td></tr>';
         return;
       }
 
-      const displayRows = [...rows].sort((a, b) => (
-        categoryRank(a.model_category) - categoryRank(b.model_category)
-        || String(a.model_category || '').localeCompare(String(b.model_category || ''), 'zh-CN')
-        || compareRate(a, b)
-        || groupLabel(a).localeCompare(groupLabel(b), 'zh-CN')
-        || String(a.group_platform || '').localeCompare(String(b.group_platform || ''), 'zh-CN')
-        || String(a.record_type || '').localeCompare(String(b.record_type || ''), 'zh-CN')
-        || String(a.site_host || a.site || '').localeCompare(String(b.site_host || b.site || ''), 'zh-CN')
-        || String(a.plan_name || '').localeCompare(String(b.plan_name || ''), 'zh-CN')
-      ));
-      let currentCategory = '';
+      if (!displayRows.length) {
+        resultBody.innerHTML = '<tr><td colspan="10" class="empty">没有符合筛选条件的数据</td></tr>';
+        return;
+      }
+
       let currentCandidate = '';
       const htmlRows = [];
       for (const row of displayRows) {
         const category = row.model_category || '其他';
-        if (category !== currentCategory) {
-          currentCategory = category;
-          currentCandidate = '';
-          htmlRows.push(`<tr class="group-row"><td colspan="10">${escapeHtml(category)}</td></tr>`);
-        }
         const candidate = `${rateLabel(row)}|${row.site_host || row.site || ''}|${groupLabel(row)}|${row.group_platform || ''}`;
-        if (candidate !== currentCandidate) {
+        if (activeCategory && candidate !== currentCandidate) {
           currentCandidate = candidate;
           htmlRows.push(`<tr class="subgroup-row"><td colspan="10">${escapeHtml(candidateLabel(row))}</td></tr>`);
         }
         const validity = [row.validity_days, row.validity_unit].filter(Boolean).join(' ');
         htmlRows.push(`<tr>
-          <td>${escapeHtml(row.record_type)}</td>
+          <td>${escapeHtml(recordTypeLabel(row.record_type))}</td>
           <td>${escapeHtml(row.site_host || row.site)}</td>
           <td><span class="category-badge">${escapeHtml(category)}</span><small>${escapeHtml(row.model_names)}</small></td>
           <td>${escapeHtml(row.group_name || row.group_id)}</td>
@@ -946,9 +1160,21 @@ CONTROL_HTML = r"""<!doctype html>
     function applySavedSite(site) {
       if (!site) return;
       siteInput.value = site.site || '';
-      siteNameInput.value = site.site || '';
+      siteNameInput.value = site.name || site.site || '';
+      lastAutoNote = siteNameInput.value;
+      noteTouched = false;
       apiBaseInput.value = site.api_base || '/api/v1';
       intervalHoursInput.value = site.interval_minutes ? String(Math.round(site.interval_minutes / 60 * 100) / 100) : '3';
+    }
+
+    function syncDefaultNote(force = false) {
+      const site = siteInput.value.trim();
+      if (!site) return;
+      if (force || !noteTouched || !siteNameInput.value.trim() || siteNameInput.value === lastAutoNote) {
+        siteNameInput.value = site;
+        lastAutoNote = site;
+        noteTouched = false;
+      }
     }
 
     async function saveSite() {
@@ -965,6 +1191,8 @@ CONTROL_HTML = r"""<!doctype html>
       savedSites = result.saved_sites || [];
       renderSavedSites();
       savedSiteSelect.value = result.site;
+      const saved = savedSites.find((item) => item.site === result.site);
+      if (saved) applySavedSite(saved);
       log(`已保存站点：${result.site}`);
     }
 
@@ -979,6 +1207,36 @@ CONTROL_HTML = r"""<!doctype html>
       log(`已删除站点：${result.site}`);
     }
 
+    function stopLoginAutoCapture() {
+      if (loginAutoCaptureTimer) {
+        clearInterval(loginAutoCaptureTimer);
+        loginAutoCaptureTimer = null;
+      }
+      loginAutoCaptureBusy = false;
+      lastAutoCaptureError = '';
+    }
+
+    async function tryLoginAutoCapture() {
+      if (loginAutoCaptureBusy) return;
+      loginAutoCaptureBusy = true;
+      try {
+        const ok = await capture({ auto: true });
+        if (ok) {
+          stopLoginAutoCapture();
+          log('已自动抓取价格并收起 WebView 登录窗口');
+        }
+      } finally {
+        loginAutoCaptureBusy = false;
+      }
+    }
+
+    function startLoginAutoCapture() {
+      stopLoginAutoCapture();
+      log('已启动登录后自动抓取：完成登录后会自动抓取价格并收起 WebView 窗口。');
+      loginAutoCaptureTimer = setInterval(tryLoginAutoCapture, 5000);
+      setTimeout(tryLoginAutoCapture, 1500);
+    }
+
     async function openSite() {
       const result = await window.pywebview.api.open_site(siteInput.value);
       if (!result.ok) {
@@ -986,31 +1244,44 @@ CONTROL_HTML = r"""<!doctype html>
         return;
       }
       siteInput.value = result.site;
-      rows = [];
       render();
       setState('WebView 登录中');
       log(`已在 WebView 打开：${result.site}`);
-      log('请在目标站点窗口完成登录，然后回到这里点击“WebView抓取”。');
+      log('请在目标站点窗口完成登录；登录态可用后应用会自动抓取并收起该窗口。');
+      startLoginAutoCapture();
     }
 
-    async function capture() {
+    async function capture(options = {}) {
+      const auto = Boolean(options.auto);
+      if (!auto) stopLoginAutoCapture();
       captureBtn.disabled = true;
-      setState('WebView 抓取中');
-      log('开始从 WebView 当前登录页抓取价格接口');
+      setState(auto ? '等待登录完成' : 'WebView 抓取中');
+      if (!auto) log('开始从 WebView 当前登录页抓取价格接口');
       try {
-        const result = await window.pywebview.api.capture_prices(apiBaseInput.value, includeGroupsInput.checked);
+        const result = await window.pywebview.api.capture_prices(apiBaseInput.value, includeGroupsInput.checked, true);
         if (!result.ok) {
-          setState('抓取失败');
-          log(result.error);
-          return;
+          if (auto) {
+            setState('等待登录完成');
+            if (result.error && result.error !== lastAutoCaptureError) {
+              lastAutoCaptureError = result.error;
+              log(`自动抓取等待中：${result.error}`);
+            }
+          } else {
+            setState('抓取失败');
+            log(result.error);
+          }
+          return false;
         }
         rows = result.rows || [];
+        savedSites = result.saved_sites || savedSites;
         latestGeneratedAt = result.generated_at || latestGeneratedAt;
+        renderSavedSites();
         render();
         const errorOnly = rows.length > 0 && rows.every((row) => row.record_type === 'error');
         setState(errorOnly ? '未获取到价格' : '抓取完成');
         log(`认证方式：${result.tokenKey || 'cookie/session'}`);
         log(`WebView 抓取完成：${rows.length} 行`);
+        return true;
       } finally {
         captureBtn.disabled = false;
       }
@@ -1083,7 +1354,13 @@ CONTROL_HTML = r"""<!doctype html>
       latestGeneratedAt = state.latest_generated_at || '';
       renderSavedSites();
       render();
-      siteNameInput.value = siteInput.value || '';
+      const currentSite = savedSites.find((item) => item.site === state.site);
+      if (currentSite) {
+        applySavedSite(currentSite);
+        savedSiteSelect.value = currentSite.site;
+      } else if (siteInput.value) {
+        syncDefaultNote(true);
+      }
       if (state.site) {
         log('请点击“WebView登录”，在目标站点窗口完成登录。');
       } else {
@@ -1096,12 +1373,20 @@ CONTROL_HTML = r"""<!doctype html>
     }
 
     siteInput.addEventListener('input', () => {
-      siteNameInput.value = siteInput.value;
+      syncDefaultNote();
+    });
+    siteNameInput.addEventListener('input', () => {
+      noteTouched = true;
     });
     savedSiteSelect.addEventListener('change', () => {
       const site = savedSites.find((item) => item.site === savedSiteSelect.value);
       applySavedSite(site);
     });
+    filterInput.addEventListener('input', render);
+    siteFilterSelect.addEventListener('change', render);
+    typeFilterSelect.addEventListener('change', render);
+    maxRateInput.addEventListener('input', render);
+    priceOnlyInput.addEventListener('change', render);
     saveSiteBtn.addEventListener('click', saveSite);
     deleteSiteBtn.addEventListener('click', deleteSite);
     openSiteBtn.addEventListener('click', openSite);
@@ -1123,17 +1408,75 @@ class PriceAppApi:
         self.rows = []
         self.browser_window = None
         self.controller_window = None
+        self.browser_lock = threading.Lock()
         self.update_lock = threading.Lock()
         self.scheduler_stop = threading.Event()
         self.scheduler_thread = None
         self.scheduler_message = "自动检查未启动"
         self.latest_generated_at = self._latest_generated_at()
 
+    def attach_browser_window(self, window):
+        self.browser_window = window
+        if window:
+            window.events.closed += self._on_browser_closed
+        return window
+
+    def _on_browser_closed(self, window=None):
+        if window is None or window is self.browser_window:
+            self.browser_window = None
+
+    def _browser_alive(self):
+        if not self.browser_window:
+            return False
+        try:
+            self.browser_window.get_current_url()
+            return True
+        except Exception:
+            self.browser_window = None
+            return False
+
+    def _ensure_browser_window(self, url=None, visible=False):
+        with self.browser_lock:
+            if not self._browser_alive():
+                self.attach_browser_window(webview.create_window(
+                    "目标站点 WebView 登录",
+                    url=url or BLANK_PAGE,
+                    width=1120,
+                    height=820,
+                    min_size=(760, 520),
+                    hidden=not visible,
+                    focus=visible,
+                    text_select=True,
+                ))
+            window = self.browser_window
+            if url:
+                window.load_url(url)
+            if visible:
+                try:
+                    window.show()
+                except Exception:
+                    pass
+                try:
+                    window.restore()
+                except Exception:
+                    pass
+            return window
+
+    def _hide_browser_window(self):
+        if not self.browser_window:
+            return
+        try:
+            self.browser_window.hide()
+        except Exception:
+            self.browser_window = None
+
     def initial_state(self):
+        latest_rows = load_latest_rows()
+        self.rows = latest_rows
         return {
             "site": self.site,
             "saved_sites": annotate_saved_sites(load_saved_sites()),
-            "latest_rows": load_latest_rows(),
+            "latest_rows": latest_rows,
             "latest_generated_at": self.latest_generated_at,
         }
 
@@ -1169,20 +1512,19 @@ class PriceAppApi:
     def open_site(self, site):
         try:
             self.site = normalize_site(site)
-            self.rows = []
-            if not self.browser_window:
-                raise RuntimeError("WebView 登录窗口未初始化")
-            self.browser_window.load_url(self.site)
+            self._ensure_browser_window(self.site, visible=True)
             return {"ok": True, "site": self.site}
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
 
-    def capture_prices(self, api_base=API_BASE, include_groups=True):
+    def capture_prices(self, api_base=API_BASE, include_groups=True, close_browser=True):
         try:
             if not self.site:
                 raise RuntimeError("请先打开目标站点")
-            if not self.browser_window:
-                raise RuntimeError("WebView 登录窗口未初始化")
+            if self._browser_alive():
+                self._ensure_browser_window(visible=False)
+            else:
+                self._ensure_browser_window(self.site, visible=False)
             base = str(api_base or API_BASE).strip()
             if not base.startswith("/"):
                 base = f"/{base}"
@@ -1197,7 +1539,10 @@ class PriceAppApi:
                 raise RuntimeError(f"抓取脚本返回了异常结果：{result!r}")
             if "rows" not in result:
                 raise RuntimeError(result.get("message") or json.dumps(result, ensure_ascii=False))
-            self.rows = result.get("rows") or []
+            fresh_rows = result.get("rows") or []
+            if not self._has_price_rows(fresh_rows):
+                raise RuntimeError(self._rows_error_message(fresh_rows) or "还没有获取到价格，请确认已完成登录")
+            self.rows = merge_price_rows(load_latest_rows(), fresh_rows)
             snapshot = write_price_snapshot(self.rows, {
                 "site_count": 1,
                 "success_count": 1,
@@ -1205,7 +1550,19 @@ class PriceAppApi:
                 "mode": "manual_webview",
             })
             self.latest_generated_at = snapshot["generated_at"]
-            return {"ok": True, "generated_at": self.latest_generated_at, **result}
+            saved_sites = annotate_saved_sites(load_saved_sites())
+            record = next((item for item in load_saved_sites() if item.get("site") == self.site), None)
+            if record:
+                saved_sites = self._update_site_status(record, {"ok": True, "rows": fresh_rows})
+            if close_browser:
+                self._hide_browser_window()
+            return {
+                "ok": True,
+                **result,
+                "generated_at": self.latest_generated_at,
+                "rows": self.rows,
+                "saved_sites": saved_sites,
+            }
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
 
@@ -1306,17 +1663,7 @@ class PriceAppApi:
         merged_sites.sort(key=lambda item: (item.get("name") or item.get("site") or "").lower())
         write_saved_sites(merged_sites)
 
-        if only_due:
-            previous_rows = load_latest_rows()
-            all_rows = [
-                row for row in previous_rows
-                if (row.get("site_host") or urlparse(str(row.get("site") or "")).netloc) not in updated_hosts
-            ]
-            all_rows.extend(fresh_rows)
-        else:
-            all_rows = fresh_rows
-
-        all_rows.sort(key=row_sort_key)
+        all_rows = merge_price_rows(load_latest_rows(), fresh_rows)
         summary = {
             "site_count": len(due_sites),
             "success_count": success_count,
@@ -1337,10 +1684,8 @@ class PriceAppApi:
         site = normalize_site(record.get("site", ""))
         base = self._normalized_api_base(record.get("api_base", API_BASE))
         try:
-            if not self.browser_window:
-                raise RuntimeError("WebView 登录窗口未初始化")
             self.site = site
-            self.browser_window.load_url(site)
+            self._ensure_browser_window(site, visible=False)
             self._wait_webview_ready(site, timeout=45)
             options = {
                 "base": base,
@@ -1353,6 +1698,8 @@ class PriceAppApi:
                 raise RuntimeError(f"WebView 抓取返回了异常结果：{result!r}")
             if "rows" not in result:
                 raise RuntimeError(result.get("message") or json.dumps(result, ensure_ascii=False))
+            if not self._has_price_rows(result.get("rows") or []):
+                raise RuntimeError(self._rows_error_message(result.get("rows") or []) or "未获取到价格")
             result["ok"] = True
             return result
         except Exception as exc:
@@ -1421,7 +1768,7 @@ class PriceAppApi:
         rows = result.get("rows") or []
         now = datetime.now(timezone.utc).isoformat()
         updated["site"] = normalize_site(updated.get("site", ""))
-        updated["name"] = updated["site"]
+        updated["name"] = str(updated.get("name") or updated["site"])
         updated["api_base"] = self._normalized_api_base(updated.get("api_base", API_BASE))
         updated["browser_mode"] = "webview"
         updated["auto_refresh"] = True
@@ -1452,6 +1799,24 @@ class PriceAppApi:
         except (TypeError, ValueError):
             hours = 3.0
         return max(1, int(round(hours * 60)))
+
+    @staticmethod
+    def _has_price_rows(rows):
+        return any(
+            isinstance(row, dict)
+            and row.get("record_type") in ("plan", "group")
+            and row.get("status") != "error"
+            for row in rows or []
+        )
+
+    @staticmethod
+    def _rows_error_message(rows):
+        messages = [
+            str(row.get("error") or "").strip()
+            for row in rows or []
+            if isinstance(row, dict) and row.get("error")
+        ]
+        return " | ".join(message for message in messages if message)
 
     @staticmethod
     def _latest_generated_at():
@@ -1530,8 +1895,9 @@ class PriceAppApi:
         now = datetime.now(timezone.utc).isoformat()
         previous = next((item for item in saved if item.get("site") == site), {})
         interval = PriceAppApi._interval_minutes(interval_hours)
+        label = str(name or "").strip() or site
         record = {
-            "name": site,
+            "name": label,
             "site": site,
             "api_base": normalized_base,
             "browser_mode": "webview",
@@ -1582,10 +1948,12 @@ def main():
         width=1120,
         height=820,
         min_size=(760, 520),
+        hidden=True,
+        focus=False,
         text_select=True,
     )
     api.controller_window = controller
-    api.browser_window = browser
+    api.attach_browser_window(browser)
 
     profile_dir = output_dir() / "price-webview-profile"
     profile_dir.mkdir(parents=True, exist_ok=True)
