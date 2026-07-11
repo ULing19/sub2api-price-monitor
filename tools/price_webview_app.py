@@ -14,6 +14,7 @@ import sys
 import threading
 import time
 from ctypes import wintypes
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse, urlunparse
 
@@ -98,6 +99,10 @@ def requires_reauthorization(error, current_url="", has_password_input=False):
 CRED_TYPE_GENERIC = 1
 CRED_PERSIST_LOCAL_MACHINE = 2
 ERROR_NOT_FOUND = 1168
+ERROR_ALREADY_EXISTS = 183
+APP_MUTEX_NAME = f"Local\\{APP_NAME}.SingleInstance"
+_APP_MUTEX_HANDLE = None
+MAX_SITE_WORKERS = 2
 
 
 class _CREDENTIAL_ATTRIBUTEW(ctypes.Structure):
@@ -229,6 +234,40 @@ def delete_site_credentials(site):
 def has_site_credentials(site):
     credential = read_site_credentials(site)
     return bool(credential and credential.get("password"))
+
+
+def acquire_single_instance():
+    global _APP_MUTEX_HANDLE
+    if os.name != "nt":
+        return True
+    kernel32 = ctypes.WinDLL("Kernel32.dll", use_last_error=True)
+    create_mutex = kernel32.CreateMutexW
+    create_mutex.argtypes = [ctypes.c_void_p, wintypes.BOOL, wintypes.LPCWSTR]
+    create_mutex.restype = wintypes.HANDLE
+    close_handle = kernel32.CloseHandle
+    close_handle.argtypes = [wintypes.HANDLE]
+    close_handle.restype = wintypes.BOOL
+    handle = create_mutex(None, False, APP_MUTEX_NAME)
+    if not handle:
+        return True
+    if ctypes.get_last_error() == ERROR_ALREADY_EXISTS:
+        close_handle(handle)
+        ctypes.windll.user32.MessageBoxW(
+            None,
+            "Sub2API 中转站比价已经在运行。",
+            "Sub2API 中转站比价",
+            0x40,
+        )
+        return False
+    _APP_MUTEX_HANDLE = handle
+    return True
+
+
+def release_single_instance():
+    global _APP_MUTEX_HANDLE
+    if os.name == "nt" and _APP_MUTEX_HANDLE:
+        ctypes.windll.kernel32.CloseHandle(_APP_MUTEX_HANDLE)
+        _APP_MUTEX_HANDLE = None
 
 
 def bundled_root():
@@ -929,7 +968,7 @@ CONTROL_HTML = r"""<!doctype html>
     .content {
       min-height: 0;
       display: grid;
-      grid-template-rows: auto auto auto 1fr 152px;
+      grid-template-rows: auto auto auto minmax(260px, 1fr) auto 152px;
       gap: 12px;
       padding: 14px 18px 18px;
     }
@@ -1002,6 +1041,23 @@ CONTROL_HTML = r"""<!doctype html>
       font-weight: 800;
     }
     .empty { color: #778397; text-align: center; }
+    .pager {
+      display: flex;
+      align-items: center;
+      justify-content: flex-end;
+      gap: 8px;
+      min-height: 32px;
+      color: #64748b;
+      font-size: 12px;
+    }
+    .pager button {
+      width: 34px;
+      height: 32px;
+      padding: 0;
+      font-size: 18px;
+      line-height: 1;
+    }
+    .pager[hidden] { display: none; }
     .console {
       min-height: 0;
       border: 1px solid #1c2c3d;
@@ -1151,6 +1207,11 @@ CONTROL_HTML = r"""<!doctype html>
           </tbody>
         </table>
       </div>
+      <div class="pager" id="pager">
+        <button id="prevPageBtn" type="button" aria-label="上一页" title="上一页">&lsaquo;</button>
+        <span id="pageStatus">1 / 1</span>
+        <button id="nextPageBtn" type="button" aria-label="下一页" title="下一页">&rsaquo;</button>
+      </div>
       <div class="console">
         <div class="console-head">
           <span>运行控制台</span>
@@ -1194,10 +1255,23 @@ CONTROL_HTML = r"""<!doctype html>
     const planCount = document.querySelector('#planCount');
     const groupCount = document.querySelector('#groupCount');
     const categoryCount = document.querySelector('#categoryCount');
+    const pager = document.querySelector('#pager');
+    const prevPageBtn = document.querySelector('#prevPageBtn');
+    const nextPageBtn = document.querySelector('#nextPageBtn');
+    const pageStatus = document.querySelector('#pageStatus');
     let rows = [];
     let savedSites = [];
     let latestGeneratedAt = '';
+    let stateRevision = 0;
     let activeCategory = '';
+    let currentPage = 0;
+    let renderDebounceTimer = null;
+    let statusPollTimer = null;
+    let statusPollBusy = false;
+    let lastHandledUpdateId = 0;
+    const logLines = [];
+    const PAGE_SIZE = 200;
+    const MAX_LOG_LINES = 240;
     let loginAutoCaptureTimer = null;
     let loginAutoCaptureBusy = false;
     let loginAutoCaptureMode = '';
@@ -1224,8 +1298,19 @@ CONTROL_HTML = r"""<!doctype html>
 
     function log(message) {
       const line = `[${new Date().toLocaleTimeString()}] ${message}`;
-      logBox.textContent = logBox.textContent ? `${logBox.textContent}\n${line}` : line;
+      logLines.push(line);
+      if (logLines.length > MAX_LOG_LINES) logLines.splice(0, logLines.length - MAX_LOG_LINES);
+      logBox.textContent = logLines.join('\n');
       logBox.scrollTop = logBox.scrollHeight;
+    }
+
+    function scheduleRender(resetPage = true) {
+      if (resetPage) currentPage = 0;
+      if (renderDebounceTimer) clearTimeout(renderDebounceTimer);
+      renderDebounceTimer = setTimeout(() => {
+        renderDebounceTimer = null;
+        render();
+      }, 120);
     }
 
     function setState(text) {
@@ -1384,6 +1469,7 @@ CONTROL_HTML = r"""<!doctype html>
       for (const button of categoryTabs.querySelectorAll('button')) {
         button.addEventListener('click', () => {
           activeCategory = button.dataset.category || '';
+          currentPage = 0;
           render();
         });
       }
@@ -1444,16 +1530,24 @@ CONTROL_HTML = r"""<!doctype html>
       renderCategoryTabs();
       renderSiteFilterOptions();
       const displayRows = getFilteredRows();
+      const pageCount = Math.max(1, Math.ceil(displayRows.length / PAGE_SIZE));
+      currentPage = Math.min(currentPage, pageCount - 1);
+      const pageStart = currentPage * PAGE_SIZE;
+      const pageRows = displayRows.slice(pageStart, pageStart + PAGE_SIZE);
       const plans = displayRows.filter((row) => row.record_type === 'plan');
       const groups = displayRows.filter((row) => row.record_type === 'group');
       const categories = new Set(displayRows.map((row) => row.model_category).filter((category) => CATEGORY_ORDER.includes(category)));
       planCount.textContent = String(plans.length);
       groupCount.textContent = String(groups.length);
       categoryCount.textContent = String(categories.size);
-      rowCount.textContent = `${displayRows.length}/${rows.length} 行`;
+      rowCount.textContent = `${displayRows.length}/${rows.length} 行 · ${currentPage + 1}/${pageCount} 页`;
       exportCsvBtn.disabled = rows.length === 0;
       exportJsonBtn.disabled = rows.length === 0;
       renderCategoryStrip(displayRows);
+      pager.hidden = displayRows.length <= PAGE_SIZE;
+      prevPageBtn.disabled = currentPage <= 0;
+      nextPageBtn.disabled = currentPage >= pageCount - 1;
+      pageStatus.textContent = `${currentPage + 1} / ${pageCount}`;
 
       if (!rows.length) {
         resultBody.innerHTML = '<tr><td colspan="10" class="empty">暂无数据</td></tr>';
@@ -1467,7 +1561,7 @@ CONTROL_HTML = r"""<!doctype html>
 
       let currentCandidate = '';
       const htmlRows = [];
-      for (const row of displayRows) {
+      for (const row of pageRows) {
         const category = row.model_category || '其他';
         const candidate = `${rateLabel(row)}|${row.site_host || row.site || ''}|${groupLabel(row)}|${row.group_platform || ''}`;
         if (activeCategory && candidate !== currentCandidate) {
@@ -1527,6 +1621,7 @@ CONTROL_HTML = r"""<!doctype html>
         return;
       }
       savedSites = result.saved_sites || [];
+      stateRevision = Number(result.revision) || stateRevision;
       renderSavedSites();
       savedSiteSelect.value = result.site;
       const saved = savedSites.find((item) => item.site === result.site);
@@ -1541,6 +1636,7 @@ CONTROL_HTML = r"""<!doctype html>
         return;
       }
       savedSites = result.saved_sites || [];
+      stateRevision = Number(result.revision) || stateRevision;
       reauthQueue = reauthQueue.filter((item) => item.site !== result.site);
       if (reauthActiveSite === result.site) {
         stopLoginAutoCapture();
@@ -1561,6 +1657,7 @@ CONTROL_HTML = r"""<!doctype html>
         return;
       }
       savedSites = result.saved_sites || savedSites;
+      stateRevision = Number(result.revision) || stateRevision;
       renderSavedSites();
       savedSiteSelect.value = result.site;
       log(result.deleted ? `已清除站点密码：${result.site}` : `该站点没有已保存密码：${result.site}`);
@@ -1692,6 +1789,8 @@ CONTROL_HTML = r"""<!doctype html>
         rows = result.rows || [];
         savedSites = result.saved_sites || savedSites;
         latestGeneratedAt = result.generated_at || latestGeneratedAt;
+        stateRevision = Number(result.revision) || stateRevision;
+        currentPage = 0;
         renderSavedSites();
         render();
         const errorOnly = rows.length > 0 && rows.every((row) => row.record_type === 'error');
@@ -1720,31 +1819,22 @@ CONTROL_HTML = r"""<!doctype html>
     }
 
     async function updateAllSaved(reason = 'manual') {
-      updateAllBtn.disabled = true;
       setState(reason === 'startup' ? '启动抓取中' : '更新全部中');
       log(reason === 'startup' ? '启动后自动抓取所有已保存站点' : '开始更新所有已保存站点');
-      try {
-        const result = await window.pywebview.api.update_all_prices();
-        if (!result.ok) {
-          setState('更新失败');
-          log(result.error);
-          return;
-        }
-        rows = result.rows || [];
-        savedSites = result.saved_sites || savedSites;
-        latestGeneratedAt = result.generated_at || latestGeneratedAt;
-        renderSavedSites();
-        render();
-        const reauthSites = result.reauth_sites || [];
-        enqueueReauthSites(reauthSites);
-        setState(reauthSites.length ? '需要重新授权' : '更新完成');
-        log(`已更新 ${result.summary?.site_count || 0} 个站点，得到 ${rows.length} 行`);
-        if (reauthSites.length) {
-          log(`${reauthSites.length} 个站点登录态已失效，将逐个打开 WebView 重新授权。`);
-        }
-      } finally {
-        updateAllBtn.disabled = false;
+      const result = await window.pywebview.api.start_update_all_prices(reason, false);
+      if (!result.ok) {
+        setState('更新失败');
+        log(result.error);
+        return;
       }
+      if (result.busy) {
+        setState('更新已在运行');
+        log('已有更新任务正在运行，本次操作不会重复启动。');
+      } else if (result.accepted) {
+        updateAllBtn.disabled = true;
+        setState('后台更新中');
+      }
+      scheduleStatusPoll(250);
     }
 
     async function startAutoCheck() {
@@ -1759,20 +1849,66 @@ CONTROL_HTML = r"""<!doctype html>
       log('自动检查已启动，会按各站点设置的间隔检查所有保存的网站');
     }
 
-    async function pollSchedulerStatus() {
-      const result = await window.pywebview.api.scheduler_status();
-      if (!result.ok) return;
+    function scheduleStatusPoll(delay = 8000) {
+      if (statusPollTimer) clearTimeout(statusPollTimer);
+      statusPollTimer = setTimeout(pollSchedulerStatus, delay);
+    }
+
+    function applyRuntimeStatus(result) {
       savedSites = result.saved_sites || savedSites;
       renderSavedSites();
       enqueueReauthSites(result.reauth_sites || []);
-      if (result.latest_generated_at && result.latest_generated_at !== latestGeneratedAt) {
-        latestGeneratedAt = result.latest_generated_at;
-        rows = result.rows || rows;
+      if (result.rows_changed) {
+        stateRevision = Number(result.revision) || stateRevision;
+        latestGeneratedAt = result.latest_generated_at || latestGeneratedAt;
+        rows = result.rows || [];
+        currentPage = 0;
         render();
-        log(`自动检查已刷新：${latestGeneratedAt}`);
+      } else if (result.revision) {
+        stateRevision = Number(result.revision) || stateRevision;
       }
-      if (result.running && !reauthActiveSite && !reauthQueue.length) {
+
+      const update = result.update || {};
+      const updating = update.status === 'running';
+      updateAllBtn.disabled = updating;
+      if (updating) {
+        const completed = Number(update.completed_sites) || 0;
+        const total = Number(update.total_sites) || 0;
+        setState(total ? `更新中 ${completed}/${total}` : '后台更新中');
+      } else if (update.id && update.id > lastHandledUpdateId && ['completed', 'failed'].includes(update.status)) {
+        lastHandledUpdateId = update.id;
+        if (update.status === 'completed') {
+          const summary = update.summary || {};
+          const reauthSites = result.reauth_sites || [];
+          setState(reauthSites.length ? '需要重新授权' : '更新完成');
+          log(`已更新 ${summary.site_count || 0} 个站点，${summary.success_count || 0} 成功，${summary.error_count || 0} 失败，当前 ${rows.length} 行`);
+          if (reauthSites.length) {
+            log(`${reauthSites.length} 个站点登录态已失效，将逐个打开 WebView 重新授权。`);
+          }
+        } else {
+          setState('更新失败');
+          log(update.error || update.message || '后台更新失败');
+        }
+      }
+      if (!updating && result.running && !reauthActiveSite && !reauthQueue.length && !update.id) {
         stateBadge.textContent = '自动检查中';
+      }
+    }
+
+    async function pollSchedulerStatus() {
+      if (statusPollBusy) return;
+      statusPollBusy = true;
+      let delay = 8000;
+      try {
+        const result = await window.pywebview.api.scheduler_status(stateRevision);
+        if (!result.ok) return;
+        applyRuntimeStatus(result);
+        delay = result.update?.status === 'running' ? 1000 : 8000;
+      } catch (error) {
+        delay = 3000;
+      } finally {
+        statusPollBusy = false;
+        scheduleStatusPoll(delay);
       }
     }
 
@@ -1782,6 +1918,7 @@ CONTROL_HTML = r"""<!doctype html>
       savedSites = state.saved_sites || [];
       rows = state.latest_rows || [];
       latestGeneratedAt = state.latest_generated_at || '';
+      stateRevision = Number(state.revision) || 0;
       renderSavedSites();
       render();
       const currentSite = savedSites.find((item) => item.site === state.site);
@@ -1796,13 +1933,14 @@ CONTROL_HTML = r"""<!doctype html>
       } else {
         log('请输入目标站点地址，然后点击“WebView登录”。');
       }
-      if (savedSites.length) {
-        await updateAllSaved('startup');
-      }
       enqueueReauthSites(savedSites.filter((item) => (
         item.reauth_required || item.last_status === 'reauth_required'
       )));
       await startAutoCheck();
+      if (savedSites.length) {
+        await updateAllSaved('startup');
+      }
+      scheduleStatusPoll(500);
     }
 
     siteInput.addEventListener('input', () => {
@@ -1815,11 +1953,21 @@ CONTROL_HTML = r"""<!doctype html>
       const site = savedSites.find((item) => item.site === savedSiteSelect.value);
       applySavedSite(site);
     });
-    filterInput.addEventListener('input', render);
-    siteFilterSelect.addEventListener('change', render);
-    typeFilterSelect.addEventListener('change', render);
-    maxRateInput.addEventListener('input', render);
-    priceOnlyInput.addEventListener('change', render);
+    filterInput.addEventListener('input', () => scheduleRender(true));
+    siteFilterSelect.addEventListener('change', () => { currentPage = 0; render(); });
+    typeFilterSelect.addEventListener('change', () => { currentPage = 0; render(); });
+    maxRateInput.addEventListener('input', () => scheduleRender(true));
+    priceOnlyInput.addEventListener('change', () => { currentPage = 0; render(); });
+    prevPageBtn.addEventListener('click', () => {
+      if (currentPage > 0) {
+        currentPage -= 1;
+        render();
+      }
+    });
+    nextPageBtn.addEventListener('click', () => {
+      currentPage += 1;
+      render();
+    });
     rememberCredentialsInput.addEventListener('change', () => {
       if (!rememberCredentialsInput.checked) autoLoginInput.checked = false;
     });
@@ -1831,11 +1979,10 @@ CONTROL_HTML = r"""<!doctype html>
     clearCredentialsBtn.addEventListener('click', clearCredentials);
     openSiteBtn.addEventListener('click', openSite);
     captureBtn.addEventListener('click', capture);
-    updateAllBtn.addEventListener('click', updateAllSaved);
+    updateAllBtn.addEventListener('click', () => updateAllSaved('manual'));
     exportCsvBtn.addEventListener('click', () => exportRows('csv'));
     exportJsonBtn.addEventListener('click', () => exportRows('json'));
     window.addEventListener('pywebviewready', init);
-    setInterval(pollSchedulerStatus, 30000);
   </script>
 </body>
 </html>
@@ -1853,17 +2000,29 @@ class BrowserCredentialBridge:
 class PriceAppApi:
     def __init__(self, site=""):
         self.site = normalize_site(site) if str(site or "").strip() else ""
-        self.rows = []
+        self.rows = load_latest_rows()
         self.browser_window = None
+        self.worker_windows = [None] * MAX_SITE_WORKERS
         self.controller_window = None
         self.credential_bridge = BrowserCredentialBridge(self)
         self.auto_login_attempts = {}
         self.browser_lock = threading.Lock()
+        self.worker_window_lock = threading.Lock()
+        self.interactive_operation_lock = threading.Lock()
+        self.worker_operation_locks = [threading.Lock() for _ in range(MAX_SITE_WORKERS)]
+        self.data_lock = threading.RLock()
+        self.state_lock = threading.RLock()
+        self.job_lock = threading.RLock()
         self.update_lock = threading.Lock()
         self.scheduler_stop = threading.Event()
         self.scheduler_thread = None
         self.scheduler_message = "自动检查未启动"
         self.latest_generated_at = self._latest_generated_at()
+        self.cached_saved_sites = annotate_saved_sites(load_saved_sites())
+        self.state_revision = 1
+        self.update_thread = None
+        self.update_job_sequence = 0
+        self.update_job = self._idle_update_job()
 
     def attach_browser_window(self, window):
         self.browser_window = window
@@ -1871,19 +2030,45 @@ class PriceAppApi:
             window.events.closed += self._on_browser_closed
         return window
 
+    def attach_worker_window(self, window, slot=0):
+        self.worker_windows[slot] = window
+        if window:
+            window.events.closed += (
+                lambda closed_window=None, worker_slot=slot: self._on_worker_closed(
+                    worker_slot, closed_window
+                )
+            )
+        return window
+
     def _on_browser_closed(self, window=None):
         if window is None or window is self.browser_window:
             self.browser_window = None
 
-    def _browser_alive(self):
-        if not self.browser_window:
+    def _on_worker_closed(self, slot, window=None):
+        if window is None or window is self.worker_windows[slot]:
+            self.worker_windows[slot] = None
+
+    @staticmethod
+    def _window_alive(window):
+        if not window:
             return False
         try:
-            self.browser_window.get_current_url()
+            window.get_current_url()
             return True
         except Exception:
-            self.browser_window = None
             return False
+
+    def _browser_alive(self):
+        if self._window_alive(self.browser_window):
+            return True
+        self.browser_window = None
+        return False
+
+    def _worker_alive(self, slot):
+        if self._window_alive(self.worker_windows[slot]):
+            return True
+        self.worker_windows[slot] = None
+        return False
 
     def _ensure_browser_window(self, url=None, visible=False):
         with self.browser_lock:
@@ -1913,6 +2098,24 @@ class PriceAppApi:
                     pass
             return window
 
+    def _ensure_worker_window(self, slot, url=None):
+        with self.worker_window_lock:
+            if not self._worker_alive(slot):
+                self.attach_worker_window(webview.create_window(
+                    f"后台价格抓取 {slot + 1}",
+                    url=url or BLANK_PAGE,
+                    width=960,
+                    height=720,
+                    min_size=(640, 480),
+                    hidden=True,
+                    focus=False,
+                    text_select=False,
+                ), slot)
+            window = self.worker_windows[slot]
+            if url:
+                window.load_url(url)
+            return window
+
     def _hide_browser_window(self):
         if not self.browser_window:
             return
@@ -1921,16 +2124,82 @@ class PriceAppApi:
         except Exception:
             self.browser_window = None
 
+    @staticmethod
+    def _idle_update_job():
+        return {
+            "id": 0,
+            "status": "idle",
+            "reason": "",
+            "message": "",
+            "started_at": "",
+            "completed_at": "",
+            "completed_sites": 0,
+            "total_sites": 0,
+            "current_site": "",
+            "summary": {},
+            "error": "",
+        }
+
+    def _cache_state(self, rows=None, saved_sites=None, generated_at=None):
+        with self.state_lock:
+            if rows is not None:
+                self.rows = rows
+            if saved_sites is not None:
+                self.cached_saved_sites = saved_sites
+            if generated_at is not None:
+                self.latest_generated_at = generated_at
+            self.state_revision += 1
+            return self.state_revision
+
+    def _mark_credentials_cached(self, site, present):
+        normalized = normalize_site(site)
+        with self.state_lock:
+            changed = False
+            updated_sites = []
+            for item in self.cached_saved_sites:
+                updated = dict(item)
+                if updated.get("site") == normalized:
+                    value = bool(present)
+                    changed = changed or updated.get("credentials_saved") != value
+                    updated["credentials_saved"] = value
+                updated_sites.append(updated)
+            if changed:
+                self.cached_saved_sites = updated_sites
+                self.state_revision += 1
+            return self.state_revision
+
+    def _state_snapshot(self, known_revision=None):
+        try:
+            known = int(known_revision)
+        except (TypeError, ValueError):
+            known = -1
+        with self.state_lock:
+            revision = self.state_revision
+            saved_sites = [dict(item) for item in self.cached_saved_sites]
+            rows = [dict(item) for item in self.rows] if known != revision else []
+            generated_at = self.latest_generated_at
+        with self.job_lock:
+            update = dict(self.update_job)
+            update["summary"] = dict(update.get("summary") or {})
+        return {
+            "revision": revision,
+            "rows_changed": known != revision,
+            "rows": rows,
+            "saved_sites": saved_sites,
+            "latest_generated_at": generated_at,
+            "update": update,
+        }
+
     def initial_state(self):
-        latest_rows = load_latest_rows()
-        saved_sites = annotate_saved_sites(load_saved_sites())
-        self.rows = latest_rows
+        snapshot = self._state_snapshot()
         return {
             "site": self.site,
-            "saved_sites": saved_sites,
-            "reauth_sites": self._reauth_sites(saved_sites),
-            "latest_rows": latest_rows,
-            "latest_generated_at": self.latest_generated_at,
+            "saved_sites": snapshot["saved_sites"],
+            "reauth_sites": self._reauth_sites(snapshot["saved_sites"]),
+            "latest_rows": snapshot["rows"],
+            "latest_generated_at": snapshot["latest_generated_at"],
+            "revision": snapshot["revision"],
+            "update": snapshot["update"],
         }
 
     def save_site(
@@ -1945,33 +2214,45 @@ class PriceAppApi:
     ):
         try:
             normalized = normalize_site(site)
-            if not remember_credentials:
-                delete_site_credentials(normalized)
-                self.auto_login_attempts.pop(normalized, None)
-            saved = self._upsert_saved_site(
-                name,
-                normalized,
-                api_base,
-                interval_hours,
-                remember_credentials,
-                auto_login,
-            )
-            return {"ok": True, "site": normalized, "saved_sites": annotate_saved_sites(saved)}
+            with self.data_lock:
+                if not remember_credentials:
+                    delete_site_credentials(normalized)
+                    self.auto_login_attempts.pop(normalized, None)
+                saved = self._upsert_saved_site(
+                    name,
+                    normalized,
+                    api_base,
+                    interval_hours,
+                    remember_credentials,
+                    auto_login,
+                )
+                annotated = annotate_saved_sites(saved)
+                revision = self._cache_state(saved_sites=annotated)
+            return {
+                "ok": True,
+                "site": normalized,
+                "saved_sites": annotated,
+                "revision": revision,
+            }
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
 
     def delete_site(self, site):
         try:
             normalized = normalize_site(site)
-            credentials_deleted = delete_site_credentials(normalized)
-            saved = [item for item in load_saved_sites() if item.get("site") != normalized]
-            write_saved_sites(saved)
-            self.auto_login_attempts.pop(normalized, None)
+            with self.data_lock:
+                credentials_deleted = delete_site_credentials(normalized)
+                saved = [item for item in load_saved_sites() if item.get("site") != normalized]
+                write_saved_sites(saved)
+                self.auto_login_attempts.pop(normalized, None)
+                annotated = annotate_saved_sites(saved)
+                revision = self._cache_state(saved_sites=annotated)
             return {
                 "ok": True,
                 "site": normalized,
                 "credentials_deleted": credentials_deleted,
-                "saved_sites": annotate_saved_sites(saved),
+                "saved_sites": annotated,
+                "revision": revision,
             }
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
@@ -1979,13 +2260,16 @@ class PriceAppApi:
     def clear_credentials(self, site):
         try:
             normalized = normalize_site(site)
-            deleted = delete_site_credentials(normalized)
-            self.auto_login_attempts.pop(normalized, None)
+            with self.data_lock:
+                deleted = delete_site_credentials(normalized)
+                self.auto_login_attempts.pop(normalized, None)
+                revision = self._mark_credentials_cached(normalized, False)
             return {
                 "ok": True,
                 "site": normalized,
                 "deleted": deleted,
-                "saved_sites": annotate_saved_sites(load_saved_sites()),
+                "saved_sites": self._state_snapshot(revision)["saved_sites"],
+                "revision": revision,
             }
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
@@ -2001,11 +2285,14 @@ class PriceAppApi:
             if record.get("remember_credentials") is False:
                 return {"ok": True, "site": self.site, "ignored": True}
             write_site_credentials(self.site, username, password)
-            return {"ok": True, "site": self.site}
+            revision = self._mark_credentials_cached(self.site, True)
+            return {"ok": True, "site": self.site, "revision": revision}
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
 
     def open_site(self, site):
+        if not self.interactive_operation_lock.acquire(blocking=False):
+            return {"ok": False, "busy": True, "error": "登录窗口正在抓取，请稍后再试"}
         try:
             self.site = normalize_site(site)
             self._ensure_browser_window(self.site, visible=True)
@@ -2016,10 +2303,14 @@ class PriceAppApi:
             return {
                 "ok": False,
                 "error": error,
-                "auth_required": self._current_page_requires_reauthorization(error),
+                "auth_required": self._current_page_requires_reauthorization(error, self.browser_window),
             }
+        finally:
+            self.interactive_operation_lock.release()
 
     def capture_prices(self, api_base=API_BASE, include_groups=True, close_browser=True):
+        if not self.interactive_operation_lock.acquire(blocking=False):
+            return {"ok": False, "busy": True, "error": "WebView 正在执行其他操作"}
         try:
             if not self.site:
                 raise RuntimeError("请先打开目标站点")
@@ -2027,9 +2318,10 @@ class PriceAppApi:
                 self._ensure_browser_window(visible=False)
             else:
                 self._ensure_browser_window(self.site, visible=False)
-            credential_state = self._prepare_login_credentials(self.site)
+            window = self.browser_window
+            credential_state = self._prepare_login_credentials(self.site, window, allow_save=True)
             if credential_state.get("autoSubmitted"):
-                self._wait_for_auto_login(self.site)
+                self._wait_for_auto_login(self.site, window, allow_save=True)
             base = str(api_base or API_BASE).strip()
             if not base.startswith("/"):
                 base = f"/{base}"
@@ -2037,9 +2329,10 @@ class PriceAppApi:
                 "base": base,
                 "includeGroups": bool(include_groups),
                 "outputFields": OUTPUT_FIELDS,
+                "requestTimeoutMs": 25000,
             }
             script = collector_js_template().replace("__OPTIONS__", json.dumps(options, ensure_ascii=False))
-            result = self._evaluate_async(script, timeout=90)
+            result = self._evaluate_async(window, script, timeout=60)
             if not isinstance(result, dict):
                 raise RuntimeError(f"抓取脚本返回了异常结果：{result!r}")
             if "rows" not in result:
@@ -2048,45 +2341,159 @@ class PriceAppApi:
             if not self._has_price_rows(fresh_rows):
                 raise RuntimeError(self._rows_error_message(fresh_rows) or "还没有获取到价格，请确认已完成登录")
             self.auto_login_attempts.pop(self.site, None)
-            self.rows = merge_price_rows(load_latest_rows(), fresh_rows)
-            snapshot = write_price_snapshot(self.rows, {
-                "site_count": 1,
-                "success_count": 1,
-                "error_count": 0,
-                "mode": "manual_webview",
-            })
-            self.latest_generated_at = snapshot["generated_at"]
-            saved_sites = annotate_saved_sites(load_saved_sites())
-            record = next((item for item in load_saved_sites() if item.get("site") == self.site), None)
-            if record:
-                saved_sites = self._update_site_status(record, {"ok": True, "rows": fresh_rows})
+            with self.data_lock:
+                merged_rows = merge_price_rows(load_latest_rows(), fresh_rows)
+                snapshot = write_price_snapshot(merged_rows, {
+                    "site_count": 1,
+                    "success_count": 1,
+                    "error_count": 0,
+                    "mode": "manual_webview",
+                })
+                record = next((item for item in load_saved_sites() if item.get("site") == self.site), None)
+                if record:
+                    saved_sites = self._update_site_status(record, {"ok": True, "rows": fresh_rows})
+                else:
+                    saved_sites = [dict(item) for item in self.cached_saved_sites]
+                revision = self._cache_state(
+                    rows=merged_rows,
+                    saved_sites=saved_sites,
+                    generated_at=snapshot["generated_at"],
+                )
             if close_browser:
                 self._hide_browser_window()
             return {
                 "ok": True,
                 **result,
-                "generated_at": self.latest_generated_at,
-                "rows": self.rows,
+                "generated_at": snapshot["generated_at"],
+                "rows": merged_rows,
                 "saved_sites": saved_sites,
+                "revision": revision,
             }
         except Exception as exc:
             error = str(exc)
             return {
                 "ok": False,
                 "error": error,
-                "auth_required": self._current_page_requires_reauthorization(error),
+                "auth_required": self._current_page_requires_reauthorization(error, self.browser_window),
             }
+        finally:
+            self.interactive_operation_lock.release()
 
     def update_all_prices(self):
+        return self.start_update_all_prices("manual", False)
+
+    def start_update_all_prices(self, reason="manual", only_due=False):
         try:
-            with self.update_lock:
-                sites = load_saved_sites()
+            with self.job_lock:
+                if self.update_thread and self.update_thread.is_alive():
+                    return {
+                        "ok": True,
+                        "accepted": False,
+                        "busy": True,
+                        "update": dict(self.update_job),
+                    }
+                with self.data_lock:
+                    sites = load_saved_sites()
                 if not sites:
                     raise RuntimeError("还没有保存站点")
-                result = self._run_site_records(sites, only_due=False)
-                return {"ok": True, **result}
+                due_sites = [
+                    item for item in sites
+                    if item.get("site") and (not only_due or self._is_site_due(item))
+                ]
+                if only_due and not due_sites:
+                    return {
+                        "ok": True,
+                        "accepted": False,
+                        "busy": False,
+                        "due": False,
+                        "update": dict(self.update_job),
+                    }
+                self.update_job_sequence += 1
+                job_id = self.update_job_sequence
+                self.update_job = {
+                    "id": job_id,
+                    "status": "running",
+                    "reason": str(reason or "manual"),
+                    "message": "准备更新站点",
+                    "started_at": datetime.now(timezone.utc).isoformat(),
+                    "completed_at": "",
+                    "completed_sites": 0,
+                    "total_sites": len(due_sites),
+                    "current_site": "",
+                    "summary": {},
+                    "error": "",
+                }
+                self.update_thread = threading.Thread(
+                    target=self._run_update_job,
+                    args=(job_id, sites, bool(only_due)),
+                    name=f"price-update-{job_id}",
+                    daemon=True,
+                )
+                self.update_thread.start()
+                return {
+                    "ok": True,
+                    "accepted": True,
+                    "busy": False,
+                    "update": dict(self.update_job),
+                }
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
+
+    def _run_update_job(self, job_id, sites, only_due):
+        try:
+            with self.update_lock:
+                result = self._run_site_records(
+                    sites,
+                    only_due=only_due,
+                    progress_callback=lambda completed, total, site: self._update_job_progress(
+                        job_id, completed, total, site
+                    ),
+                )
+            summary = result.get("summary") or {}
+            message = (
+                f"更新完成：{summary.get('site_count', 0)} 个站点，"
+                f"{summary.get('success_count', 0)} 成功，"
+                f"{summary.get('error_count', 0)} 失败"
+            )
+            with self.job_lock:
+                if self.update_job.get("id") == job_id:
+                    self.update_job.update({
+                        "status": "completed",
+                        "message": message,
+                        "completed_at": datetime.now(timezone.utc).isoformat(),
+                        "completed_sites": summary.get("site_count", 0),
+                        "current_site": "",
+                        "summary": summary,
+                        "error": "",
+                    })
+            self.scheduler_message = message
+        except Exception as exc:
+            error = str(exc)
+            with self.job_lock:
+                if self.update_job.get("id") == job_id:
+                    self.update_job.update({
+                        "status": "failed",
+                        "message": f"更新失败：{error}",
+                        "completed_at": datetime.now(timezone.utc).isoformat(),
+                        "current_site": "",
+                        "error": error,
+                    })
+            self.scheduler_message = f"自动检查失败：{error}"
+        finally:
+            with self.job_lock:
+                if self.update_thread is threading.current_thread():
+                    self.update_thread = None
+
+    def _update_job_progress(self, job_id, completed, total, site):
+        with self.job_lock:
+            if self.update_job.get("id") != job_id:
+                return
+            self.update_job.update({
+                "completed_sites": int(completed),
+                "total_sites": int(total),
+                "current_site": str(site or ""),
+                "message": f"正在更新 {completed}/{total}：{site}",
+            })
 
     def start_scheduler(self):
         if self.scheduler_thread and self.scheduler_thread.is_alive():
@@ -2102,36 +2509,26 @@ class PriceAppApi:
         self.scheduler_message = "自动检查已停止"
         return {"ok": True, "running": False}
 
-    def scheduler_status(self):
+    def scheduler_status(self, known_revision=None):
         running = bool(self.scheduler_thread and self.scheduler_thread.is_alive())
-        saved_sites = annotate_saved_sites(load_saved_sites())
+        snapshot = self._state_snapshot(known_revision)
         return {
             "ok": True,
             "running": running,
             "message": self.scheduler_message,
-            "saved_sites": saved_sites,
-            "reauth_sites": self._reauth_sites(saved_sites),
-            "rows": load_latest_rows(),
-            "latest_generated_at": self._latest_generated_at(),
+            **snapshot,
+            "reauth_sites": self._reauth_sites(snapshot["saved_sites"]),
         }
 
     def _scheduler_loop(self):
-        while not self.scheduler_stop.is_set():
-            try:
-                with self.update_lock:
-                    result = self._run_site_records(load_saved_sites(), only_due=True)
-                    if result["summary"]["site_count"]:
-                        self.scheduler_message = (
-                            f"自动检查完成：{result['summary']['site_count']} 个站点，"
-                            f"{result['summary']['success_count']} 成功，"
-                            f"{result['summary']['error_count']} 失败，"
-                            f"{result['summary']['reauth_count']} 需重新授权"
-                        )
-            except Exception as exc:
-                self.scheduler_message = f"自动检查失败：{exc}"
-            self.scheduler_stop.wait(30)
+        while not self.scheduler_stop.wait(30):
+            result = self.start_update_all_prices("scheduler", True)
+            if result.get("accepted"):
+                self.scheduler_message = "后台自动检查中"
+            elif not result.get("ok"):
+                self.scheduler_message = f"自动检查失败：{result.get('error', '未知错误')}"
 
-    def _run_site_records(self, sites, only_due):
+    def _run_site_records(self, sites, only_due, progress_callback=None):
         due_sites = []
         for record in sites:
             if not record.get("site"):
@@ -2141,12 +2538,13 @@ class PriceAppApi:
             due_sites.append(record)
 
         if not due_sites:
-            saved_sites = annotate_saved_sites(load_saved_sites())
+            snapshot = self._state_snapshot(self.state_revision)
+            saved_sites = snapshot["saved_sites"]
             return {
-                "rows": load_latest_rows(),
+                "rows": [dict(item) for item in self.rows],
                 "saved_sites": saved_sites,
                 "reauth_sites": self._reauth_sites(saved_sites),
-                "generated_at": self._latest_generated_at(),
+                "generated_at": self.latest_generated_at,
                 "summary": {
                     "site_count": 0,
                     "success_count": 0,
@@ -2157,37 +2555,80 @@ class PriceAppApi:
             }
 
         fresh_rows = []
-        updated_records = {item.get("site"): dict(item) for item in sites}
+        captured_updates = {}
         success_count = 0
         error_count = 0
-        for record in due_sites:
-            result = self._capture_site_webview(record, include_groups=True)
-            rows = result.get("rows") or []
-            fresh_rows.extend(rows)
-            updated = self._site_status_record(record, result)
-            updated_records[updated["site"]] = updated
-            if result.get("ok"):
-                success_count += 1
-            else:
-                error_count += 1
+        worker_count = min(MAX_SITE_WORKERS, len(due_sites))
+        if progress_callback:
+            progress_callback(0, len(due_sites), due_sites[0].get("site", ""))
+        with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="site-capture") as executor:
+            futures = {
+                executor.submit(
+                    self._capture_site_webview,
+                    record,
+                    True,
+                    index % worker_count,
+                ): record
+                for index, record in enumerate(due_sites)
+            }
+            completed = 0
+            for future in as_completed(futures):
+                record = futures[future]
+                result = future.result()
+                rows = result.get("rows") or []
+                fresh_rows.extend(rows)
+                updated = self._site_status_record(record, result)
+                captured_updates[updated["site"]] = updated
+                if result.get("ok"):
+                    success_count += 1
+                else:
+                    error_count += 1
+                completed += 1
+                if progress_callback:
+                    progress_callback(completed, len(due_sites), record.get("site", ""))
 
-        merged_sites = list(updated_records.values())
-        merged_sites.sort(key=lambda item: (item.get("name") or item.get("site") or "").lower())
-        write_saved_sites(merged_sites)
-        annotated_sites = annotate_saved_sites(merged_sites)
-        reauth_sites = self._reauth_sites(annotated_sites)
-
-        all_rows = merge_price_rows(load_latest_rows(), fresh_rows)
-        summary = {
-            "site_count": len(due_sites),
-            "success_count": success_count,
-            "error_count": error_count,
-            "reauth_count": len(reauth_sites),
-            "skipped_count": max(0, len(sites) - len(due_sites)),
-        }
-        snapshot = write_price_snapshot(all_rows, summary)
-        self.rows = all_rows
-        self.latest_generated_at = snapshot["generated_at"]
+        with self.data_lock:
+            current_records = load_saved_sites()
+            status_fields = (
+                "last_run",
+                "last_status",
+                "last_error",
+                "reauth_required",
+                "reauth_requested_at",
+                "last_row_count",
+                "last_plan_count",
+                "next_run",
+                "updated_at",
+            )
+            merged_sites = []
+            for current in current_records:
+                site = current.get("site")
+                status_update = captured_updates.get(site)
+                if status_update:
+                    merged = dict(current)
+                    for field in status_fields:
+                        merged[field] = status_update.get(field)
+                    merged_sites.append(merged)
+                else:
+                    merged_sites.append(current)
+            merged_sites.sort(key=lambda item: (item.get("name") or item.get("site") or "").lower())
+            write_saved_sites(merged_sites)
+            annotated_sites = annotate_saved_sites(merged_sites)
+            reauth_sites = self._reauth_sites(annotated_sites)
+            summary = {
+                "site_count": len(due_sites),
+                "success_count": success_count,
+                "error_count": error_count,
+                "reauth_count": len(reauth_sites),
+                "skipped_count": max(0, len(sites) - len(due_sites)),
+            }
+            all_rows = merge_price_rows(load_latest_rows(), fresh_rows)
+            snapshot = write_price_snapshot(all_rows, summary)
+            self._cache_state(
+                rows=all_rows,
+                saved_sites=annotated_sites,
+                generated_at=snapshot["generated_at"],
+            )
         return {
             "rows": all_rows,
             "saved_sites": annotated_sites,
@@ -2196,53 +2637,55 @@ class PriceAppApi:
             "summary": summary,
         }
 
-    def _capture_site_webview(self, record, include_groups=True):
+    def _capture_site_webview(self, record, include_groups=True, worker_slot=0):
         site = normalize_site(record.get("site", ""))
         base = self._normalized_api_base(record.get("api_base", API_BASE))
-        try:
-            self.site = site
-            self._ensure_browser_window(site, visible=False)
-            self._wait_webview_ready(site, timeout=45)
-            credential_state = self._prepare_login_credentials(site)
-            if credential_state.get("autoSubmitted"):
-                self._wait_for_auto_login(site)
-            options = {
-                "base": base,
-                "includeGroups": bool(include_groups),
-                "outputFields": OUTPUT_FIELDS,
-            }
-            script = collector_js_template().replace("__OPTIONS__", json.dumps(options, ensure_ascii=False))
-            result = self._evaluate_async(script, timeout=90)
-            if not isinstance(result, dict):
-                raise RuntimeError(f"WebView 抓取返回了异常结果：{result!r}")
-            if "rows" not in result:
-                raise RuntimeError(result.get("message") or json.dumps(result, ensure_ascii=False))
-            if not self._has_price_rows(result.get("rows") or []):
-                raise RuntimeError(self._rows_error_message(result.get("rows") or []) or "未获取到价格")
-            self.auto_login_attempts.pop(site, None)
-            result["ok"] = True
-            return result
-        except Exception as exc:
-            now = datetime.now(timezone.utc).isoformat()
-            error = str(exc)
-            auth_required = self._current_page_requires_reauthorization(error)
-            return {
-                "ok": False,
-                "auth_required": auth_required,
-                "tokenKey": "",
-                "rows": [{
-                    "site": site,
-                    "site_host": urlparse(site).netloc,
-                    "status": "error",
-                    "source": "webview",
-                    "record_type": "error",
-                    "model_category": "未获取",
-                    "model_names": "",
-                    "fetched_at": now,
+        with self.worker_operation_locks[worker_slot]:
+            window = None
+            try:
+                window = self._ensure_worker_window(worker_slot, site)
+                self._wait_webview_ready(window, site, timeout=30)
+                credential_state = self._prepare_login_credentials(site, window, allow_save=False)
+                if credential_state.get("autoSubmitted"):
+                    self._wait_for_auto_login(site, window, allow_save=False)
+                options = {
+                    "base": base,
+                    "includeGroups": bool(include_groups),
+                    "outputFields": OUTPUT_FIELDS,
+                    "requestTimeoutMs": 25000,
+                }
+                script = collector_js_template().replace("__OPTIONS__", json.dumps(options, ensure_ascii=False))
+                result = self._evaluate_async(window, script, timeout=60)
+                if not isinstance(result, dict):
+                    raise RuntimeError(f"WebView 抓取返回了异常结果：{result!r}")
+                if "rows" not in result:
+                    raise RuntimeError(result.get("message") or json.dumps(result, ensure_ascii=False))
+                if not self._has_price_rows(result.get("rows") or []):
+                    raise RuntimeError(self._rows_error_message(result.get("rows") or []) or "未获取到价格")
+                self.auto_login_attempts.pop(site, None)
+                result["ok"] = True
+                return result
+            except Exception as exc:
+                now = datetime.now(timezone.utc).isoformat()
+                error = str(exc)
+                auth_required = self._current_page_requires_reauthorization(error, window)
+                return {
+                    "ok": False,
+                    "auth_required": auth_required,
+                    "tokenKey": "",
+                    "rows": [{
+                        "site": site,
+                        "site_host": urlparse(site).netloc,
+                        "status": "error",
+                        "source": "webview",
+                        "record_type": "error",
+                        "model_category": "未获取",
+                        "model_names": "",
+                        "fetched_at": now,
+                        "error": error,
+                    }],
                     "error": error,
-                }],
-                "error": error,
-            }
+                }
 
     @staticmethod
     def _same_site_host(site, current_url):
@@ -2261,21 +2704,29 @@ class PriceAppApi:
         normalized = normalize_site(site)
 
         def worker():
+            if not self.interactive_operation_lock.acquire(timeout=5):
+                return
             try:
-                self._wait_webview_ready(normalized, timeout=30)
+                window = self.browser_window
+                self._wait_webview_ready(window, normalized, timeout=30)
                 if self.site == normalized:
-                    self._prepare_login_credentials(normalized)
+                    self._prepare_login_credentials(normalized, window, allow_save=True)
             except Exception:
                 return
+            finally:
+                self.interactive_operation_lock.release()
 
         threading.Thread(target=worker, daemon=True).start()
 
-    def _prepare_login_credentials(self, site):
+    def _prepare_login_credentials(self, site, window=None, allow_save=False):
         try:
             normalized = normalize_site(site)
-            if self.site != normalized or not self.browser_window:
+            window = window or self.browser_window
+            if not window:
                 return {"loginForm": False}
-            current_url = self.browser_window.get_current_url() or ""
+            if window is self.browser_window and self.site != normalized:
+                return {"loginForm": False}
+            current_url = window.get_current_url() or ""
             if not self._same_site_host(normalized, current_url):
                 return {"loginForm": False}
             record = self._record_for_site(normalized, API_BASE)
@@ -2293,11 +2744,12 @@ class PriceAppApi:
                 "__CREDENTIALS__",
                 json.dumps(credential, ensure_ascii=False) if credential else "null",
             )
-            result = self.browser_window.evaluate_js(script)
+            result = window.evaluate_js(script)
             if isinstance(result, dict) and result.get("autoSubmitted"):
                 self.auto_login_attempts[normalized] = time.time()
             if (
-                isinstance(result, dict)
+                allow_save
+                and isinstance(result, dict)
                 and result.get("loginForm")
                 and not result.get("ambiguous")
                 and result.get("password")
@@ -2307,30 +2759,33 @@ class PriceAppApi:
                     result.get("username") or "",
                     result.get("password") or "",
                 )
+                self._mark_credentials_cached(normalized, True)
             return result if isinstance(result, dict) else {"loginForm": False}
         except Exception:
             return {"loginForm": False}
 
-    def _wait_for_auto_login(self, site, timeout=15):
+    def _wait_for_auto_login(self, site, window, allow_save=False, timeout=15):
         deadline = time.time() + timeout
         while time.time() < deadline:
             time.sleep(0.5)
-            state = self._prepare_login_credentials(site)
+            state = self._prepare_login_credentials(site, window, allow_save=allow_save)
             if not state.get("loginForm"):
                 return True
             if state.get("blockedByChallenge"):
                 return False
         return False
 
-    def _wait_webview_ready(self, site, timeout=45):
+    def _wait_webview_ready(self, window, site, timeout=45):
+        if not window:
+            raise RuntimeError("WebView 窗口不可用")
         expected_origin = urlparse(site).netloc
         deadline = time.time() + timeout
         last_error = ""
         while time.time() < deadline:
             try:
-                current_url = self.browser_window.get_current_url()
+                current_url = window.get_current_url()
                 current_host = urlparse(current_url).netloc
-                ready = self.browser_window.evaluate_js("document.readyState")
+                ready = window.evaluate_js("document.readyState")
                 if current_host == expected_origin and ready in ("interactive", "complete"):
                     time.sleep(1)
                     return
@@ -2341,8 +2796,11 @@ class PriceAppApi:
 
     def _record_for_site(self, site, api_base):
         normalized = normalize_site(site)
-        for record in load_saved_sites():
+        with self.state_lock:
+            cached = [dict(item) for item in self.cached_saved_sites]
+        for record in cached:
             if record.get("site") == normalized:
+                record.pop("credentials_saved", None)
                 return record
         now = datetime.now(timezone.utc)
         return {
@@ -2426,16 +2884,17 @@ class PriceAppApi:
         ]
         return " | ".join(message for message in messages if message)
 
-    def _current_page_requires_reauthorization(self, error):
+    def _current_page_requires_reauthorization(self, error, window=None):
         current_url = ""
         has_password_input = False
-        if self.browser_window:
+        window = window or self.browser_window
+        if window:
             try:
-                current_url = self.browser_window.get_current_url() or ""
+                current_url = window.get_current_url() or ""
             except Exception:
                 current_url = ""
             try:
-                has_password_input = bool(self.browser_window.evaluate_js(
+                has_password_input = bool(window.evaluate_js(
                     "(() => {"
                     "const visible = e => { const r=e.getBoundingClientRect(); const s=getComputedStyle(e); "
                     "return !e.disabled && r.width>0 && r.height>0 && s.display!=='none' && s.visibility!=='hidden'; };"
@@ -2509,7 +2968,7 @@ class PriceAppApi:
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
 
-    def _evaluate_async(self, script, timeout):
+    def _evaluate_async(self, window, script, timeout):
         done = threading.Event()
         holder = {}
 
@@ -2517,7 +2976,7 @@ class PriceAppApi:
             holder["result"] = result
             done.set()
 
-        immediate = self.browser_window.evaluate_js(script, callback=callback)
+        immediate = window.evaluate_js(script, callback=callback)
         if immediate not in (True, "true", None):
             return immediate
         if not done.wait(timeout):
@@ -2584,41 +3043,45 @@ def parse_args():
 
 
 def main():
+    if not acquire_single_instance():
+        return
     args = parse_args()
     site = normalize_site(args.site) if str(args.site or "").strip() else ""
     api = PriceAppApi(site)
+    try:
+        controller = webview.create_window(
+            "Sub2API 中转站比价",
+            html=CONTROL_HTML,
+            js_api=api,
+            width=980,
+            height=760,
+            min_size=(780, 560),
+            text_select=True,
+        )
+        browser = webview.create_window(
+            "目标站点 WebView 登录",
+            url=site or BLANK_PAGE,
+            js_api=api.credential_bridge,
+            width=1120,
+            height=820,
+            min_size=(760, 520),
+            hidden=True,
+            focus=False,
+            text_select=True,
+        )
+        api.controller_window = controller
+        api.attach_browser_window(browser)
 
-    controller = webview.create_window(
-        "Sub2API 中转站比价",
-        html=CONTROL_HTML,
-        js_api=api,
-        width=980,
-        height=760,
-        min_size=(780, 560),
-        text_select=True,
-    )
-    browser = webview.create_window(
-        "目标站点 WebView 登录",
-        url=site or BLANK_PAGE,
-        js_api=api.credential_bridge,
-        width=1120,
-        height=820,
-        min_size=(760, 520),
-        hidden=True,
-        focus=False,
-        text_select=True,
-    )
-    api.controller_window = controller
-    api.attach_browser_window(browser)
-
-    profile_dir = output_dir() / "price-webview-profile"
-    profile_dir.mkdir(parents=True, exist_ok=True)
-    webview.start(
-        gui="edgechromium",
-        debug=args.devtools,
-        private_mode=False,
-        storage_path=str(profile_dir),
-    )
+        profile_dir = output_dir() / "price-webview-profile"
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        webview.start(
+            gui="edgechromium",
+            debug=args.devtools,
+            private_mode=False,
+            storage_path=str(profile_dir),
+        )
+    finally:
+        release_single_instance()
 
 
 if __name__ == "__main__":

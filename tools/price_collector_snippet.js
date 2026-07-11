@@ -33,10 +33,24 @@
     const found = token();
     const headers = { Accept: 'application/json' };
     if (found) headers.Authorization = 'Bearer ' + found.value;
-    const response = await fetch(endpoint(suffix), {
-      headers,
-      credentials: 'include',
-    });
+    const controller = new AbortController();
+    const timeoutMs = Number(options.requestTimeoutMs) > 0 ? Number(options.requestTimeoutMs) : 25000;
+    const timeoutId = window.setTimeout(() => controller.abort(), timeoutMs);
+    let response;
+    try {
+      response = await fetch(endpoint(suffix), {
+        headers,
+        credentials: 'include',
+        signal: controller.signal,
+      });
+    } catch (error) {
+      if (error && error.name === 'AbortError') {
+        throw new Error(`${suffix}: 请求超时（${Math.round(timeoutMs / 1000)} 秒）`);
+      }
+      throw error;
+    } finally {
+      window.clearTimeout(timeoutId);
+    }
     const rawText = await response.text();
     let body = null;
     try { body = rawText ? JSON.parse(rawText) : null; } catch { body = rawText; }
@@ -294,24 +308,28 @@
 
   const rows = [];
   const errors = [];
+  const [groupsResult, checkoutResult] = await Promise.allSettled([
+    apiGet('/groups/available'),
+    apiGet('/payment/checkout-info'),
+  ]);
   let groupsData = [];
   let groupsError = '';
-  try {
-    groupsData = await apiGet('/groups/available');
+  if (groupsResult.status === 'fulfilled') {
+    groupsData = groupsResult.value;
     if (!Array.isArray(groupsData)) groupsData = [];
-  } catch (error) {
-    groupsError = error.message;
+  } else {
+    groupsError = groupsResult.reason?.message || String(groupsResult.reason || '分组接口失败');
   }
   const groupMap = buildGroupMap(groupsData);
 
   let checkout = null;
-  try {
-    checkout = await apiGet('/payment/checkout-info');
+  if (checkoutResult.status === 'fulfilled') {
+    checkout = checkoutResult.value;
     for (const plan of Array.isArray(checkout.plans) ? checkout.plans : []) {
       if (plan && typeof plan === 'object') rows.push(planRecord('/payment/checkout-info', plan, checkout, groupMap));
     }
-  } catch (error) {
-    errors.push(error.message);
+  } else {
+    errors.push(checkoutResult.reason?.message || String(checkoutResult.reason || '套餐接口失败'));
   }
 
   if (rows.length === 0) {
