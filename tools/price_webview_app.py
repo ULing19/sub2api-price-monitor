@@ -104,6 +104,47 @@ APP_MUTEX_NAME = f"Local\\{APP_NAME}.SingleInstance"
 _APP_MUTEX_HANDLE = None
 MAX_SITE_WORKERS = 2
 
+ERROR_LABELS = {
+    "reauth_required": "登录/会话已失效",
+    "cloudflare_challenge": "Cloudflare 验证未完成",
+    "timeout": "请求或页面超时",
+    "http_error": "HTTP 接口错误",
+    "unsupported_response": "接口响应不支持",
+    "no_price_data": "未发现价格数据",
+    "network_error": "网络错误",
+    "window_closed": "登录窗口已关闭",
+    "unknown_error": "未知错误",
+}
+
+CLOUDFLARE_PATTERNS = (
+    r"cloudflare",
+    r"challenges\.cloudflare\.com",
+    r"cdn-cgi/challenge-platform",
+    r"just a moment",
+    r"checking your browser",
+    r"security verification",
+    r"正在进行安全验证",
+    r"安全服务防护",
+    r"人机验证",
+)
+
+TIMEOUT_PATTERNS = (
+    r"\btimeout\b",
+    r"timed out",
+    r"AbortError",
+    r"超时",
+    r"等待 WebView",
+)
+
+NETWORK_ERROR_PATTERNS = (
+    r"failed to fetch",
+    r"networkerror",
+    r"ERR_",
+    r"connection",
+    r"DNS",
+    r"网络",
+)
+
 
 class _CREDENTIAL_ATTRIBUTEW(ctypes.Structure):
     _fields_ = [
@@ -396,6 +437,13 @@ def normalize_saved_site_record(item):
     record["reauth_required"] = bool(
         record.get("reauth_required") or record.get("last_status") == "reauth_required"
     )
+    if record.get("last_status") == "ok":
+        record["last_status_label"] = record.get("last_status_label") or "正常"
+    elif record.get("last_error_code"):
+        record["last_status_label"] = record.get("last_status_label") or ERROR_LABELS.get(
+            record.get("last_error_code"),
+            ERROR_LABELS["unknown_error"],
+        )
     if site and not record.get("next_run"):
         record["next_run"] = next_run_at(record).isoformat()
     return record
@@ -1517,8 +1565,21 @@ CONTROL_HTML = r"""<!doctype html>
       savedSiteSelect.innerHTML = '<option value="">选择已保存站点</option>' + savedSites.map((site) => {
         const interval = site.interval_minutes ? ` · ${Math.round(site.interval_minutes / 60 * 100) / 100}h` : '';
         const next = site.next_run ? ` · 下次 ${formatDateTime(site.next_run)}` : '';
-        const statusLabels = { ok: '正常', error: '失败', reauth_required: '需重新授权' };
-        const status = site.last_status ? ` · ${statusLabels[site.last_status] || site.last_status}` : '';
+        const statusLabels = {
+          ok: '正常',
+          error: '失败',
+          reauth_required: '需重新授权',
+          cloudflare_challenge: 'Cloudflare 验证未完成',
+          timeout: '请求或页面超时',
+          http_error: 'HTTP 接口错误',
+          unsupported_response: '接口响应不支持',
+          no_price_data: '未发现价格数据',
+          network_error: '网络错误',
+          window_closed: '登录窗口已关闭',
+          unknown_error: '未知错误',
+        };
+        const statusText = site.last_status_label || statusLabels[site.last_status] || site.last_status;
+        const status = statusText ? ` · ${statusText}` : '';
         const credential = site.credentials_saved ? ' · 已保存密码' : '';
         const name = site.name && site.name !== site.site ? `${site.name} · ${site.site}` : site.site;
         const label = `${name}${interval}${next}${status}${credential}`;
@@ -1775,6 +1836,14 @@ CONTROL_HTML = r"""<!doctype html>
         const result = await window.pywebview.api.capture_prices(apiBaseInput.value, includeGroupsInput.checked, true);
         if (!result.ok) {
           if (auto) {
+            if (['cloudflare_challenge', 'window_closed'].includes(result.error_code)) {
+              stopLoginAutoCapture();
+              if (reauthActiveSite) reauthActiveSite = '';
+              setState(result.status_label || '等待人工处理');
+              log(`${result.status_label || '自动抓取已暂停'}：${result.error}`);
+              setTimeout(startNextReauth, 500);
+              return false;
+            }
             setState('等待登录完成');
             if (result.error && result.error !== lastAutoCaptureError) {
               lastAutoCaptureError = result.error;
@@ -2017,6 +2086,8 @@ class PriceAppApi:
         self.scheduler_stop = threading.Event()
         self.scheduler_thread = None
         self.scheduler_message = "自动检查未启动"
+        self.browser_cancel_event = threading.Event()
+        self.browser_operation_id = 0
         self.latest_generated_at = self._latest_generated_at()
         self.cached_saved_sites = annotate_saved_sites(load_saved_sites())
         self.state_revision = 1
@@ -2042,6 +2113,7 @@ class PriceAppApi:
 
     def _on_browser_closed(self, window=None):
         if window is None or window is self.browser_window:
+            self.browser_cancel_event.set()
             self.browser_window = None
 
     def _on_worker_closed(self, slot, window=None):
@@ -2073,6 +2145,8 @@ class PriceAppApi:
     def _ensure_browser_window(self, url=None, visible=False):
         with self.browser_lock:
             if not self._browser_alive():
+                self.browser_cancel_event.clear()
+                self.browser_operation_id += 1
                 self.attach_browser_window(webview.create_window(
                     "目标站点 WebView 登录",
                     url=url or BLANK_PAGE,
@@ -2086,6 +2160,8 @@ class PriceAppApi:
                 ))
             window = self.browser_window
             if url:
+                self.browser_cancel_event.clear()
+                self.browser_operation_id += 1
                 window.load_url(url)
             if visible:
                 try:
@@ -2300,10 +2376,13 @@ class PriceAppApi:
             return {"ok": True, "site": self.site}
         except Exception as exc:
             error = str(exc)
+            failure = self._classify_capture_failure(error, self.browser_window)
             return {
                 "ok": False,
                 "error": error,
-                "auth_required": self._current_page_requires_reauthorization(error, self.browser_window),
+                "auth_required": failure["auth_required"],
+                "error_code": failure["error_code"],
+                "status_label": failure["status_label"],
             }
         finally:
             self.interactive_operation_lock.release()
@@ -2314,6 +2393,8 @@ class PriceAppApi:
         try:
             if not self.site:
                 raise RuntimeError("请先打开目标站点")
+            if self.browser_cancel_event.is_set() and not self._browser_alive():
+                raise RuntimeError("WINDOW_CLOSED: 登录窗口已关闭，请重新点击 WebView 登录")
             if self._browser_alive():
                 self._ensure_browser_window(visible=False)
             else:
@@ -2339,7 +2420,9 @@ class PriceAppApi:
                 raise RuntimeError(result.get("message") or json.dumps(result, ensure_ascii=False))
             fresh_rows = result.get("rows") or []
             if not self._has_price_rows(fresh_rows):
-                raise RuntimeError(self._rows_error_message(fresh_rows) or "还没有获取到价格，请确认已完成登录")
+                error_code = self._rows_error_code(fresh_rows)
+                message = self._rows_error_message(fresh_rows) or "还没有获取到价格，请确认已完成登录"
+                raise RuntimeError(f"{error_code.upper()}: {message}" if error_code else message)
             self.auto_login_attempts.pop(self.site, None)
             with self.data_lock:
                 merged_rows = merge_price_rows(load_latest_rows(), fresh_rows)
@@ -2371,10 +2454,13 @@ class PriceAppApi:
             }
         except Exception as exc:
             error = str(exc)
+            failure = self._classify_capture_failure(error, self.browser_window)
             return {
                 "ok": False,
                 "error": error,
-                "auth_required": self._current_page_requires_reauthorization(error, self.browser_window),
+                "auth_required": failure["auth_required"],
+                "error_code": failure["error_code"],
+                "status_label": failure["status_label"],
             }
         finally:
             self.interactive_operation_lock.release()
@@ -2593,6 +2679,8 @@ class PriceAppApi:
                 "last_run",
                 "last_status",
                 "last_error",
+                "last_error_code",
+                "last_status_label",
                 "reauth_required",
                 "reauth_requested_at",
                 "last_row_count",
@@ -2661,17 +2749,21 @@ class PriceAppApi:
                 if "rows" not in result:
                     raise RuntimeError(result.get("message") or json.dumps(result, ensure_ascii=False))
                 if not self._has_price_rows(result.get("rows") or []):
-                    raise RuntimeError(self._rows_error_message(result.get("rows") or []) or "未获取到价格")
+                    error_code = self._rows_error_code(result.get("rows") or [])
+                    message = self._rows_error_message(result.get("rows") or []) or "未获取到价格"
+                    raise RuntimeError(f"{error_code.upper()}: {message}" if error_code else message)
                 self.auto_login_attempts.pop(site, None)
                 result["ok"] = True
                 return result
             except Exception as exc:
                 now = datetime.now(timezone.utc).isoformat()
                 error = str(exc)
-                auth_required = self._current_page_requires_reauthorization(error, window)
+                failure = self._classify_capture_failure(error, window)
                 return {
                     "ok": False,
-                    "auth_required": auth_required,
+                    "auth_required": failure["auth_required"],
+                    "error_code": failure["error_code"],
+                    "status_label": failure["status_label"],
                     "tokenKey": "",
                     "rows": [{
                         "site": site,
@@ -2683,6 +2775,8 @@ class PriceAppApi:
                         "model_names": "",
                         "fetched_at": now,
                         "error": error,
+                        "error_code": failure["error_code"],
+                        "status_label": failure["status_label"],
                     }],
                     "error": error,
                 }
@@ -2767,6 +2861,10 @@ class PriceAppApi:
     def _wait_for_auto_login(self, site, window, allow_save=False, timeout=15):
         deadline = time.time() + timeout
         while time.time() < deadline:
+            if window is self.browser_window and self.browser_cancel_event.is_set():
+                raise RuntimeError("WINDOW_CLOSED: 登录窗口已关闭")
+            if self._detect_cloudflare_challenge(window):
+                raise RuntimeError("CLOUDFLARE_CHALLENGE: Cloudflare 验证未完成或当前环境不兼容")
             time.sleep(0.5)
             state = self._prepare_login_credentials(site, window, allow_save=allow_save)
             if not state.get("loginForm"):
@@ -2782,15 +2880,21 @@ class PriceAppApi:
         deadline = time.time() + timeout
         last_error = ""
         while time.time() < deadline:
+            if window is self.browser_window and self.browser_cancel_event.is_set():
+                raise RuntimeError("WINDOW_CLOSED: 登录窗口已关闭")
             try:
                 current_url = window.get_current_url()
                 current_host = urlparse(current_url).netloc
                 ready = window.evaluate_js("document.readyState")
+                if self._detect_cloudflare_challenge(window):
+                    raise RuntimeError("CLOUDFLARE_CHALLENGE: Cloudflare 验证未完成或当前环境不兼容")
                 if current_host == expected_origin and ready in ("interactive", "complete"):
                     time.sleep(1)
                     return
             except Exception as exc:
                 last_error = str(exc)
+                if "CLOUDFLARE_CHALLENGE" in last_error or "WINDOW_CLOSED" in last_error:
+                    raise
             time.sleep(0.5)
         raise RuntimeError(f"等待 WebView 加载 {site} 超时：{last_error}")
 
@@ -2835,12 +2939,18 @@ class PriceAppApi:
         updated["auto_refresh"] = True
         updated["last_run"] = now
         auth_required = bool(result.get("auth_required"))
+        error_code = result.get("error_code") or ("reauth_required" if auth_required else "")
+        if not result.get("ok") and not error_code:
+            error_code = self._classify_error_text(result.get("error") or "")
+        status_label = result.get("status_label") or self._error_label(error_code)
         updated["last_status"] = (
-            "ok" if result.get("ok") else "reauth_required" if auth_required else "error"
+            "ok" if result.get("ok") else "reauth_required" if auth_required else error_code or "error"
         )
         updated["reauth_required"] = auth_required
         updated["reauth_requested_at"] = now if auth_required else ""
         updated["last_error"] = "" if result.get("ok") else (result.get("error") or "")
+        updated["last_error_code"] = "" if result.get("ok") else error_code
+        updated["last_status_label"] = "正常" if result.get("ok") else status_label
         updated["last_row_count"] = len(rows)
         updated["last_plan_count"] = len([row for row in rows if row.get("record_type") == "plan"])
         updated["next_run"] = schedule_next_run(updated, datetime.fromisoformat(now)).isoformat()
@@ -2883,6 +2993,87 @@ class PriceAppApi:
             if isinstance(row, dict) and row.get("error")
         ]
         return " | ".join(message for message in messages if message)
+
+    @staticmethod
+    def _rows_error_code(rows):
+        for row in rows or []:
+            if isinstance(row, dict) and row.get("error_code"):
+                return str(row.get("error_code") or "").strip()
+        return ""
+
+    @staticmethod
+    def _error_label(code):
+        return ERROR_LABELS.get(code or "", ERROR_LABELS["unknown_error"])
+
+    @staticmethod
+    def _looks_like_cloudflare(text):
+        value = str(text or "")
+        return any(re.search(pattern, value, re.IGNORECASE) for pattern in CLOUDFLARE_PATTERNS)
+
+    @staticmethod
+    def _classify_error_text(error, current_url=""):
+        text = f"{error or ''} {current_url or ''}"
+        if "WINDOW_CLOSED" in text:
+            return "window_closed"
+        if PriceAppApi._looks_like_cloudflare(text):
+            return "cloudflare_challenge"
+        if "REAUTH_REQUIRED" in text:
+            return "reauth_required"
+        if "TIMEOUT" in text:
+            return "timeout"
+        if "HTTP_ERROR" in text:
+            return "http_error"
+        if "UNSUPPORTED_RESPONSE" in text:
+            return "unsupported_response"
+        if "NETWORK_ERROR" in text:
+            return "network_error"
+        if any(re.search(pattern, text, re.IGNORECASE) for pattern in TIMEOUT_PATTERNS):
+            return "timeout"
+        if re.search(r"\bHTTP\s+\d{3}\b", text, re.IGNORECASE):
+            return "http_error"
+        if "rows" in text and "result" in text:
+            return "unsupported_response"
+        if any(re.search(pattern, text, re.IGNORECASE) for pattern in NETWORK_ERROR_PATTERNS):
+            return "network_error"
+        if re.search(r"未获取到价格|未发现价格|no_price|no price|no_price_found|no pricing", text, re.IGNORECASE):
+            return "no_price_data"
+        return "unknown_error"
+
+    def _classify_capture_failure(self, error, window=None):
+        current_url = ""
+        if window:
+            try:
+                current_url = window.get_current_url() or ""
+            except Exception:
+                current_url = ""
+        auth_required = self._current_page_requires_reauthorization(error, window)
+        code = "reauth_required" if auth_required else self._classify_error_text(error, current_url)
+        return {
+            "error_code": code,
+            "status_label": self._error_label(code),
+            "auth_required": code == "reauth_required",
+        }
+
+    def _detect_cloudflare_challenge(self, window):
+        if not window:
+            return False
+        try:
+            current_url = window.get_current_url() or ""
+        except Exception:
+            current_url = ""
+        if self._looks_like_cloudflare(current_url):
+            return True
+        try:
+            marker = window.evaluate_js(
+                "(() => {"
+                "const title = document.title || '';"
+                "const text = document.body ? document.body.innerText.slice(0, 2000) : '';"
+                "return [location.href, title, text].join('\\n');"
+                "})()"
+            )
+        except Exception:
+            marker = ""
+        return self._looks_like_cloudflare(marker)
 
     def _current_page_requires_reauthorization(self, error, window=None):
         current_url = ""
@@ -2979,7 +3170,14 @@ class PriceAppApi:
         immediate = window.evaluate_js(script, callback=callback)
         if immediate not in (True, "true", None):
             return immediate
-        if not done.wait(timeout):
+        deadline = time.time() + timeout
+        while not done.is_set() and time.time() < deadline:
+            if window is self.browser_window and self.browser_cancel_event.is_set():
+                raise RuntimeError("WINDOW_CLOSED: 登录窗口已关闭")
+            if self._detect_cloudflare_challenge(window):
+                raise RuntimeError("CLOUDFLARE_CHALLENGE: Cloudflare 验证未完成或当前环境不兼容")
+            done.wait(0.5)
+        if not done.is_set():
             raise TimeoutError("抓取脚本超时，请确认站点窗口已完成登录且页面可访问")
         return holder.get("result")
 
@@ -3019,6 +3217,8 @@ class PriceAppApi:
             "last_run": previous.get("last_run", ""),
             "last_status": previous.get("last_status", ""),
             "last_error": previous.get("last_error", ""),
+            "last_error_code": previous.get("last_error_code", ""),
+            "last_status_label": previous.get("last_status_label", ""),
             "reauth_required": previous.get("reauth_required", False),
             "reauth_requested_at": previous.get("reauth_requested_at", ""),
             "last_row_count": previous.get("last_row_count", 0),

@@ -45,9 +45,9 @@
       });
     } catch (error) {
       if (error && error.name === 'AbortError') {
-        throw new Error(`${suffix}: 请求超时（${Math.round(timeoutMs / 1000)} 秒）`);
+        throw new Error(`TIMEOUT: ${suffix}: 请求超时（${Math.round(timeoutMs / 1000)} 秒）`);
       }
-      throw error;
+      throw new Error(`NETWORK_ERROR: ${suffix}: ${error?.message || String(error)}`);
     } finally {
       window.clearTimeout(timeoutId);
     }
@@ -57,13 +57,37 @@
     if (!response.ok) {
       const message = typeof body === 'string' ? body.slice(0, 240) : JSON.stringify(body).slice(0, 240);
       const authHint = found ? `token=${found.key}` : '未发现 token，已尝试 Cookie 登录态';
-      throw new Error(`${suffix}: HTTP ${response.status}: ${authHint}: ${message}`);
+      throw new Error(`HTTP_ERROR: ${suffix}: HTTP ${response.status}: ${authHint}: ${message}`);
     }
     if (body && typeof body === 'object' && 'code' in body && 'data' in body) {
       if (body.code === 0 || body.code === 200 || body.success === true) return body.data;
-      throw new Error(`${suffix}: ${body.message || body.reason || body.code}`);
+      throw new Error(`UNSUPPORTED_RESPONSE: ${suffix}: ${body.message || body.reason || body.code}`);
+    }
+    if (typeof body === 'string') {
+      throw new Error(`UNSUPPORTED_RESPONSE: ${suffix}: 接口返回了非 JSON 文本`);
     }
     return body;
+  }
+
+  function failureCode(message) {
+    const text = String(message || '');
+    if (/HTTP_ERROR|HTTP\s+(401|403)|unauthori[sz]ed|forbidden|token|session/i.test(text)) return 'reauth_required';
+    if (/TIMEOUT|超时|timeout/i.test(text)) return 'timeout';
+    if (/HTTP_ERROR|HTTP\s+\d{3}/i.test(text)) return 'http_error';
+    if (/UNSUPPORTED_RESPONSE/i.test(text)) return 'unsupported_response';
+    if (/NETWORK_ERROR|failed to fetch|network/i.test(text)) return 'network_error';
+    return 'no_price_data';
+  }
+
+  function failureLabel(code) {
+    return ({
+      reauth_required: '登录/会话已失效',
+      timeout: '请求或页面超时',
+      http_error: 'HTTP 接口错误',
+      unsupported_response: '接口响应不支持',
+      network_error: '网络错误',
+      no_price_data: '未发现价格数据',
+    })[code] || '未知错误';
   }
 
   function number(value) {
@@ -354,6 +378,8 @@
   }
 
   if (rows.length === 0) {
+    const errorMessage = errors.join(' | ') || '未发现价格数据';
+    const errorCode = failureCode(errorMessage);
     rows.push({
       site: window.location.origin,
       site_host: window.location.host,
@@ -362,12 +388,18 @@
       record_type: 'error',
       model_category: '未获取',
       fetched_at: new Date().toISOString(),
-      error: errors.join(' | '),
+      error: errorMessage,
+      error_code: errorCode,
+      status_label: failureLabel(errorCode),
     });
   } else if (errors.length) {
+    const errorMessage = errors.join(' | ');
+    const errorCode = failureCode(errorMessage);
     for (const row of rows) {
       row.status = 'partial';
-      row.error = errors.join(' | ');
+      row.error = errorMessage;
+      row.error_code = errorCode;
+      row.status_label = failureLabel(errorCode);
     }
   }
 
