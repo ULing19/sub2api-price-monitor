@@ -145,6 +145,14 @@ NETWORK_ERROR_PATTERNS = (
     r"网络",
 )
 
+REAUTH_ELIGIBLE_ERROR_CODES = {
+    "reauth_required",
+    "cloudflare_challenge",
+    "http_error",
+    "unsupported_response",
+    "no_price_data",
+}
+
 
 class _CREDENTIAL_ATTRIBUTEW(ctypes.Structure):
     _fields_ = [
@@ -1836,10 +1844,16 @@ CONTROL_HTML = r"""<!doctype html>
         const result = await window.pywebview.api.capture_prices(apiBaseInput.value, includeGroupsInput.checked, true);
         if (!result.ok) {
           if (auto) {
-            if (['cloudflare_challenge', 'window_closed'].includes(result.error_code)) {
+            if (result.error_code === 'cloudflare_challenge') {
+              stopLoginAutoCapture();
+              setState('等待人工验证');
+              log(`${result.status_label || '需要人工验证'}：请在 WebView 中完成验证，验证后点击 WebView抓取。`);
+              return false;
+            }
+            if (result.error_code === 'window_closed') {
               stopLoginAutoCapture();
               if (reauthActiveSite) reauthActiveSite = '';
-              setState(result.status_label || '等待人工处理');
+              setState(result.status_label || '登录窗口已关闭');
               log(`${result.status_label || '自动抓取已暂停'}：${result.error}`);
               setTimeout(startNextReauth, 500);
               return false;
@@ -3048,10 +3062,11 @@ class PriceAppApi:
                 current_url = ""
         auth_required = self._current_page_requires_reauthorization(error, window)
         code = "reauth_required" if auth_required else self._classify_error_text(error, current_url)
+        reauth_required = code in REAUTH_ELIGIBLE_ERROR_CODES
         return {
             "error_code": code,
             "status_label": self._error_label(code),
-            "auth_required": code == "reauth_required",
+            "auth_required": reauth_required,
         }
 
     def _detect_cloudflare_challenge(self, window):
