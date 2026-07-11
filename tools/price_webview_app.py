@@ -66,6 +66,32 @@ OUTPUT_FIELDS = [
 APP_NAME = "Sub2APIPriceMonitor"
 
 
+AUTH_ERROR_PATTERNS = (
+    r"\b(?:http\s*)?(?:401|403)\b",
+    r"\bunauthori[sz]ed\b",
+    r"\bforbidden\b",
+    r"\b(?:access|refresh|auth|id)[ _-]?token\b.{0,24}\b(?:expired|invalid|missing|revoked)\b",
+    r"\b(?:expired|invalid|missing|revoked)\b.{0,24}\btoken\b",
+    r"\bsession\b.{0,24}\b(?:expired|invalid)\b",
+    r"登录(?:状态|态)?(?:已)?(?:失效|过期)",
+    r"(?:请|需要|必须).{0,8}登录",
+    r"未登录",
+    r"认证(?:失败|失效|过期)",
+    r"授权(?:失败|失效|过期)",
+    r"会话(?:失效|过期)",
+)
+
+
+def requires_reauthorization(error, current_url="", has_password_input=False):
+    if has_password_input:
+        return True
+    url = str(current_url or "").lower()
+    if re.search(r"(?:^|[/#?&=_-])(?:login|signin|sign-in|auth|authorize)(?:$|[/#?&=_-])", url):
+        return True
+    text = str(error or "").lower()
+    return any(re.search(pattern, text, re.IGNORECASE) for pattern in AUTH_ERROR_PATTERNS)
+
+
 def bundled_root():
     if getattr(sys, "frozen", False):
         return pathlib.Path(getattr(sys, "_MEIPASS", pathlib.Path(sys.executable).parent))
@@ -187,6 +213,9 @@ def normalize_saved_site_record(item):
     site = str(record.get("site") or "")
     record["name"] = str(record.get("name") or site)
     record["auto_refresh"] = True
+    record["reauth_required"] = bool(
+        record.get("reauth_required") or record.get("last_status") == "reauth_required"
+    )
     if site and not record.get("next_run"):
         record["next_run"] = next_run_at(record).isoformat()
     return record
@@ -871,7 +900,10 @@ CONTROL_HTML = r"""<!doctype html>
     let activeCategory = '';
     let loginAutoCaptureTimer = null;
     let loginAutoCaptureBusy = false;
+    let loginAutoCaptureMode = '';
     let lastAutoCaptureError = '';
+    let reauthQueue = [];
+    let reauthActiveSite = '';
     let noteTouched = false;
     let lastAutoNote = '';
     const CATEGORY_ORDER = [
@@ -1099,7 +1131,8 @@ CONTROL_HTML = r"""<!doctype html>
       savedSiteSelect.innerHTML = '<option value="">选择已保存站点</option>' + savedSites.map((site) => {
         const interval = site.interval_minutes ? ` · ${Math.round(site.interval_minutes / 60 * 100) / 100}h` : '';
         const next = site.next_run ? ` · 下次 ${formatDateTime(site.next_run)}` : '';
-        const status = site.last_status ? ` · ${site.last_status}` : '';
+        const statusLabels = { ok: '正常', error: '失败', reauth_required: '需重新授权' };
+        const status = site.last_status ? ` · ${statusLabels[site.last_status] || site.last_status}` : '';
         const name = site.name && site.name !== site.site ? `${site.name} · ${site.site}` : site.site;
         const label = `${name}${interval}${next}${status}`;
         return `<option value="${escapeHtml(site.site)}">${escapeHtml(label)}</option>`;
@@ -1203,6 +1236,12 @@ CONTROL_HTML = r"""<!doctype html>
         return;
       }
       savedSites = result.saved_sites || [];
+      reauthQueue = reauthQueue.filter((item) => item.site !== result.site);
+      if (reauthActiveSite === result.site) {
+        stopLoginAutoCapture();
+        reauthActiveSite = '';
+        setTimeout(startNextReauth, 0);
+      }
       renderSavedSites();
       log(`已删除站点：${result.site}`);
     }
@@ -1213,26 +1252,84 @@ CONTROL_HTML = r"""<!doctype html>
         loginAutoCaptureTimer = null;
       }
       loginAutoCaptureBusy = false;
+      loginAutoCaptureMode = '';
       lastAutoCaptureError = '';
+    }
+
+    function reauthLabel(record) {
+      return record?.name && record.name !== record.site
+        ? `${record.name} (${record.site})`
+        : record?.site || '未知站点';
+    }
+
+    function finishActiveReauth() {
+      if (!reauthActiveSite) return;
+      const completed = reauthActiveSite;
+      reauthActiveSite = '';
+      log(`重新授权完成：${completed}`);
+      setTimeout(startNextReauth, 500);
+    }
+
+    function enqueueReauthSites(sites) {
+      for (const record of sites || []) {
+        if (!record?.site || record.site === reauthActiveSite) continue;
+        if (reauthQueue.some((item) => item.site === record.site)) continue;
+        reauthQueue.push(record);
+        log(`检测到站点授权失效：${reauthLabel(record)}`);
+      }
+      if (!reauthActiveSite && !loginAutoCaptureTimer && reauthQueue.length) {
+        setTimeout(startNextReauth, 0);
+      }
+    }
+
+    async function startNextReauth() {
+      if (reauthActiveSite || loginAutoCaptureTimer || !reauthQueue.length) return;
+      const record = reauthQueue.shift();
+      reauthActiveSite = record.site;
+      const saved = savedSites.find((item) => item.site === record.site) || record;
+      applySavedSite(saved);
+      savedSiteSelect.value = record.site;
+      setState('需要重新授权');
+      log(`正在打开重新授权窗口：${reauthLabel(record)}`);
+      const result = await window.pywebview.api.open_site(record.site);
+      if (!result.ok) {
+        log(`重新授权窗口打开失败：${result.error}`);
+        reauthActiveSite = '';
+        setTimeout(startNextReauth, 500);
+        return;
+      }
+      siteInput.value = result.site;
+      setState('等待重新授权');
+      log('请在 WebView 中重新登录；授权恢复后会自动抓取并继续处理下一个站点。');
+      startLoginAutoCapture('reauth');
     }
 
     async function tryLoginAutoCapture() {
       if (loginAutoCaptureBusy) return;
       loginAutoCaptureBusy = true;
       try {
+        const mode = loginAutoCaptureMode;
         const ok = await capture({ auto: true });
         if (ok) {
           stopLoginAutoCapture();
-          log('已自动抓取价格并收起 WebView 登录窗口');
+          if (mode === 'reauth') {
+            finishActiveReauth();
+          } else {
+            log('已自动抓取价格并收起 WebView 登录窗口');
+            setTimeout(startNextReauth, 500);
+          }
         }
       } finally {
         loginAutoCaptureBusy = false;
       }
     }
 
-    function startLoginAutoCapture() {
+    function startLoginAutoCapture(mode = 'login') {
       stopLoginAutoCapture();
-      log('已启动登录后自动抓取：完成登录后会自动抓取价格并收起 WebView 窗口。');
+      loginAutoCaptureMode = mode;
+      log(mode === 'reauth'
+        ? '已启动重新授权检测：登录恢复后会自动抓取。'
+        : '已启动登录后自动抓取：完成登录后会自动抓取价格并收起 WebView 窗口。');
       loginAutoCaptureTimer = setInterval(tryLoginAutoCapture, 5000);
       setTimeout(tryLoginAutoCapture, 1500);
     }
@@ -1248,7 +1345,7 @@ CONTROL_HTML = r"""<!doctype html>
       setState('WebView 登录中');
       log(`已在 WebView 打开：${result.site}`);
       log('请在目标站点窗口完成登录；登录态可用后应用会自动抓取并收起该窗口。');
-      startLoginAutoCapture();
+      startLoginAutoCapture(reauthActiveSite === result.site ? 'reauth' : 'login');
     }
 
     async function capture(options = {}) {
@@ -1281,6 +1378,11 @@ CONTROL_HTML = r"""<!doctype html>
         setState(errorOnly ? '未获取到价格' : '抓取完成');
         log(`认证方式：${result.tokenKey || 'cookie/session'}`);
         log(`WebView 抓取完成：${rows.length} 行`);
+        if (!auto && reauthActiveSite) {
+          finishActiveReauth();
+        } else if (!auto) {
+          setTimeout(startNextReauth, 500);
+        }
         return true;
       } finally {
         captureBtn.disabled = false;
@@ -1313,8 +1415,13 @@ CONTROL_HTML = r"""<!doctype html>
         latestGeneratedAt = result.generated_at || latestGeneratedAt;
         renderSavedSites();
         render();
-        setState('更新完成');
+        const reauthSites = result.reauth_sites || [];
+        enqueueReauthSites(reauthSites);
+        setState(reauthSites.length ? '需要重新授权' : '更新完成');
         log(`已更新 ${result.summary?.site_count || 0} 个站点，得到 ${rows.length} 行`);
+        if (reauthSites.length) {
+          log(`${reauthSites.length} 个站点登录态已失效，将逐个打开 WebView 重新授权。`);
+        }
       } finally {
         updateAllBtn.disabled = false;
       }
@@ -1326,7 +1433,9 @@ CONTROL_HTML = r"""<!doctype html>
         log(result.error);
         return;
       }
-      setState('自动检查中');
+      if (!reauthActiveSite && !reauthQueue.length) {
+        setState('自动检查中');
+      }
       log('自动检查已启动，会按各站点设置的间隔检查所有保存的网站');
     }
 
@@ -1335,13 +1444,14 @@ CONTROL_HTML = r"""<!doctype html>
       if (!result.ok) return;
       savedSites = result.saved_sites || savedSites;
       renderSavedSites();
+      enqueueReauthSites(result.reauth_sites || []);
       if (result.latest_generated_at && result.latest_generated_at !== latestGeneratedAt) {
         latestGeneratedAt = result.latest_generated_at;
         rows = result.rows || rows;
         render();
         log(`自动检查已刷新：${latestGeneratedAt}`);
       }
-      if (result.running) {
+      if (result.running && !reauthActiveSite && !reauthQueue.length) {
         stateBadge.textContent = '自动检查中';
       }
     }
@@ -1369,6 +1479,9 @@ CONTROL_HTML = r"""<!doctype html>
       if (savedSites.length) {
         await updateAllSaved('startup');
       }
+      enqueueReauthSites(savedSites.filter((item) => (
+        item.reauth_required || item.last_status === 'reauth_required'
+      )));
       await startAutoCheck();
     }
 
@@ -1472,10 +1585,12 @@ class PriceAppApi:
 
     def initial_state(self):
         latest_rows = load_latest_rows()
+        saved_sites = annotate_saved_sites(load_saved_sites())
         self.rows = latest_rows
         return {
             "site": self.site,
-            "saved_sites": annotate_saved_sites(load_saved_sites()),
+            "saved_sites": saved_sites,
+            "reauth_sites": self._reauth_sites(saved_sites),
             "latest_rows": latest_rows,
             "latest_generated_at": self.latest_generated_at,
         }
@@ -1515,7 +1630,12 @@ class PriceAppApi:
             self._ensure_browser_window(self.site, visible=True)
             return {"ok": True, "site": self.site}
         except Exception as exc:
-            return {"ok": False, "error": str(exc)}
+            error = str(exc)
+            return {
+                "ok": False,
+                "error": error,
+                "auth_required": self._current_page_requires_reauthorization(error),
+            }
 
     def capture_prices(self, api_base=API_BASE, include_groups=True, close_browser=True):
         try:
@@ -1564,7 +1684,12 @@ class PriceAppApi:
                 "saved_sites": saved_sites,
             }
         except Exception as exc:
-            return {"ok": False, "error": str(exc)}
+            error = str(exc)
+            return {
+                "ok": False,
+                "error": error,
+                "auth_required": self._current_page_requires_reauthorization(error),
+            }
 
     def update_all_prices(self):
         try:
@@ -1593,11 +1718,13 @@ class PriceAppApi:
 
     def scheduler_status(self):
         running = bool(self.scheduler_thread and self.scheduler_thread.is_alive())
+        saved_sites = annotate_saved_sites(load_saved_sites())
         return {
             "ok": True,
             "running": running,
             "message": self.scheduler_message,
-            "saved_sites": annotate_saved_sites(load_saved_sites()),
+            "saved_sites": saved_sites,
+            "reauth_sites": self._reauth_sites(saved_sites),
             "rows": load_latest_rows(),
             "latest_generated_at": self._latest_generated_at(),
         }
@@ -1611,7 +1738,8 @@ class PriceAppApi:
                         self.scheduler_message = (
                             f"自动检查完成：{result['summary']['site_count']} 个站点，"
                             f"{result['summary']['success_count']} 成功，"
-                            f"{result['summary']['error_count']} 失败"
+                            f"{result['summary']['error_count']} 失败，"
+                            f"{result['summary']['reauth_count']} 需重新授权"
                         )
             except Exception as exc:
                 self.scheduler_message = f"自动检查失败：{exc}"
@@ -1627,20 +1755,22 @@ class PriceAppApi:
             due_sites.append(record)
 
         if not due_sites:
+            saved_sites = annotate_saved_sites(load_saved_sites())
             return {
                 "rows": load_latest_rows(),
-                "saved_sites": annotate_saved_sites(load_saved_sites()),
+                "saved_sites": saved_sites,
+                "reauth_sites": self._reauth_sites(saved_sites),
                 "generated_at": self._latest_generated_at(),
                 "summary": {
                     "site_count": 0,
                     "success_count": 0,
                     "error_count": 0,
+                    "reauth_count": len(self._reauth_sites(saved_sites)),
                     "skipped_count": len(sites),
                 },
             }
 
         fresh_rows = []
-        updated_hosts = set()
         updated_records = {item.get("site"): dict(item) for item in sites}
         success_count = 0
         error_count = 0
@@ -1648,10 +1778,6 @@ class PriceAppApi:
             result = self._capture_site_webview(record, include_groups=True)
             rows = result.get("rows") or []
             fresh_rows.extend(rows)
-            try:
-                updated_hosts.add(urlparse(normalize_site(record.get("site", ""))).netloc)
-            except ValueError:
-                pass
             updated = self._site_status_record(record, result)
             updated_records[updated["site"]] = updated
             if result.get("ok"):
@@ -1662,12 +1788,15 @@ class PriceAppApi:
         merged_sites = list(updated_records.values())
         merged_sites.sort(key=lambda item: (item.get("name") or item.get("site") or "").lower())
         write_saved_sites(merged_sites)
+        annotated_sites = annotate_saved_sites(merged_sites)
+        reauth_sites = self._reauth_sites(annotated_sites)
 
         all_rows = merge_price_rows(load_latest_rows(), fresh_rows)
         summary = {
             "site_count": len(due_sites),
             "success_count": success_count,
             "error_count": error_count,
+            "reauth_count": len(reauth_sites),
             "skipped_count": max(0, len(sites) - len(due_sites)),
         }
         snapshot = write_price_snapshot(all_rows, summary)
@@ -1675,7 +1804,8 @@ class PriceAppApi:
         self.latest_generated_at = snapshot["generated_at"]
         return {
             "rows": all_rows,
-            "saved_sites": annotate_saved_sites(merged_sites),
+            "saved_sites": annotated_sites,
+            "reauth_sites": reauth_sites,
             "generated_at": snapshot["generated_at"],
             "summary": summary,
         }
@@ -1704,8 +1834,11 @@ class PriceAppApi:
             return result
         except Exception as exc:
             now = datetime.now(timezone.utc).isoformat()
+            error = str(exc)
+            auth_required = self._current_page_requires_reauthorization(error)
             return {
                 "ok": False,
+                "auth_required": auth_required,
                 "tokenKey": "",
                 "rows": [{
                     "site": site,
@@ -1716,9 +1849,9 @@ class PriceAppApi:
                     "model_category": "未获取",
                     "model_names": "",
                     "fetched_at": now,
-                    "error": str(exc),
+                    "error": error,
                 }],
-                "error": str(exc),
+                "error": error,
             }
 
     def _wait_webview_ready(self, site, timeout=45):
@@ -1773,7 +1906,12 @@ class PriceAppApi:
         updated["browser_mode"] = "webview"
         updated["auto_refresh"] = True
         updated["last_run"] = now
-        updated["last_status"] = "ok" if result.get("ok") else "error"
+        auth_required = bool(result.get("auth_required"))
+        updated["last_status"] = (
+            "ok" if result.get("ok") else "reauth_required" if auth_required else "error"
+        )
+        updated["reauth_required"] = auth_required
+        updated["reauth_requested_at"] = now if auth_required else ""
         updated["last_error"] = "" if result.get("ok") else (result.get("error") or "")
         updated["last_row_count"] = len(rows)
         updated["last_plan_count"] = len([row for row in rows if row.get("record_type") == "plan"])
@@ -1817,6 +1955,31 @@ class PriceAppApi:
             if isinstance(row, dict) and row.get("error")
         ]
         return " | ".join(message for message in messages if message)
+
+    def _current_page_requires_reauthorization(self, error):
+        current_url = ""
+        has_password_input = False
+        if self.browser_window:
+            try:
+                current_url = self.browser_window.get_current_url() or ""
+            except Exception:
+                current_url = ""
+            try:
+                has_password_input = bool(self.browser_window.evaluate_js(
+                    "Boolean(document.querySelector('input[type=\"password\"]'))"
+                ))
+            except Exception:
+                has_password_input = False
+        return requires_reauthorization(error, current_url, has_password_input)
+
+    @staticmethod
+    def _reauth_sites(sites):
+        return [
+            item for item in sites or []
+            if isinstance(item, dict)
+            and (item.get("reauth_required") or item.get("last_status") == "reauth_required")
+            and item.get("site")
+        ]
 
     @staticmethod
     def _latest_generated_at():
@@ -1907,6 +2070,8 @@ class PriceAppApi:
             "last_run": previous.get("last_run", ""),
             "last_status": previous.get("last_status", ""),
             "last_error": previous.get("last_error", ""),
+            "reauth_required": previous.get("reauth_required", False),
+            "reauth_requested_at": previous.get("reauth_requested_at", ""),
             "last_row_count": previous.get("last_row_count", 0),
             "last_plan_count": previous.get("last_plan_count", 0),
             "next_run": previous.get("next_run") or datetime.now(timezone.utc).isoformat(),
