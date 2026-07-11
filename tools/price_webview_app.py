@@ -1,6 +1,8 @@
 #!/usr/bin/env python
 import argparse
+import ctypes
 import csv
+import hashlib
 import io
 import json
 import os
@@ -11,6 +13,7 @@ import subprocess
 import sys
 import threading
 import time
+from ctypes import wintypes
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse, urlunparse
 
@@ -90,6 +93,142 @@ def requires_reauthorization(error, current_url="", has_password_input=False):
         return True
     text = str(error or "").lower()
     return any(re.search(pattern, text, re.IGNORECASE) for pattern in AUTH_ERROR_PATTERNS)
+
+
+CRED_TYPE_GENERIC = 1
+CRED_PERSIST_LOCAL_MACHINE = 2
+ERROR_NOT_FOUND = 1168
+
+
+class _CREDENTIAL_ATTRIBUTEW(ctypes.Structure):
+    _fields_ = [
+        ("Keyword", wintypes.LPWSTR),
+        ("Flags", wintypes.DWORD),
+        ("ValueSize", wintypes.DWORD),
+        ("Value", ctypes.POINTER(ctypes.c_ubyte)),
+    ]
+
+
+class _CREDENTIALW(ctypes.Structure):
+    _fields_ = [
+        ("Flags", wintypes.DWORD),
+        ("Type", wintypes.DWORD),
+        ("TargetName", wintypes.LPWSTR),
+        ("Comment", wintypes.LPWSTR),
+        ("LastWritten", wintypes.FILETIME),
+        ("CredentialBlobSize", wintypes.DWORD),
+        ("CredentialBlob", ctypes.POINTER(ctypes.c_ubyte)),
+        ("Persist", wintypes.DWORD),
+        ("AttributeCount", wintypes.DWORD),
+        ("Attributes", ctypes.POINTER(_CREDENTIAL_ATTRIBUTEW)),
+        ("TargetAlias", wintypes.LPWSTR),
+        ("UserName", wintypes.LPWSTR),
+    ]
+
+
+if os.name == "nt":
+    _advapi32 = ctypes.WinDLL("Advapi32.dll", use_last_error=True)
+    _cred_write = _advapi32.CredWriteW
+    _cred_write.argtypes = [ctypes.POINTER(_CREDENTIALW), wintypes.DWORD]
+    _cred_write.restype = wintypes.BOOL
+    _cred_read = _advapi32.CredReadW
+    _cred_read.argtypes = [
+        wintypes.LPCWSTR,
+        wintypes.DWORD,
+        wintypes.DWORD,
+        ctypes.POINTER(ctypes.POINTER(_CREDENTIALW)),
+    ]
+    _cred_read.restype = wintypes.BOOL
+    _cred_delete = _advapi32.CredDeleteW
+    _cred_delete.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD]
+    _cred_delete.restype = wintypes.BOOL
+    _cred_free = _advapi32.CredFree
+    _cred_free.argtypes = [ctypes.c_void_p]
+    _cred_free.restype = None
+else:
+    _cred_write = None
+    _cred_read = None
+    _cred_delete = None
+    _cred_free = None
+
+
+def credential_target(site):
+    normalized = normalize_site(site)
+    digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:20]
+    return f"{APP_NAME}:{safe_host(normalized)[:80]}:{digest}"
+
+
+def read_site_credentials(site):
+    if not _cred_read:
+        return None
+    normalized = normalize_site(site)
+    pointer = ctypes.POINTER(_CREDENTIALW)()
+    if not _cred_read(credential_target(normalized), CRED_TYPE_GENERIC, 0, ctypes.byref(pointer)):
+        error = ctypes.get_last_error()
+        if error == ERROR_NOT_FOUND:
+            return None
+        raise OSError(error, "读取 Windows 凭据失败")
+    try:
+        credential = pointer.contents
+        blob = ctypes.string_at(credential.CredentialBlob, credential.CredentialBlobSize)
+        payload = json.loads(blob.decode("utf-8"))
+        if normalize_site(payload.get("site", "")) != normalized:
+            return None
+        return {
+            "site": normalized,
+            "username": str(payload.get("username") or credential.UserName or ""),
+            "password": str(payload.get("password") or ""),
+        }
+    except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
+        return None
+    finally:
+        _cred_free(pointer)
+
+
+def write_site_credentials(site, username, password):
+    if not _cred_write:
+        raise RuntimeError("保存密码仅支持 Windows 凭据管理器")
+    normalized = normalize_site(site)
+    username = str(username or "").strip()[:512]
+    password = str(password or "")
+    if not password:
+        raise ValueError("密码不能为空")
+    payload = json.dumps({
+        "site": normalized,
+        "username": username,
+        "password": password,
+    }, ensure_ascii=False).encode("utf-8")
+    if len(payload) > 2500:
+        raise ValueError("登录凭据过长，无法保存到 Windows 凭据管理器")
+    blob = (ctypes.c_ubyte * len(payload)).from_buffer_copy(payload)
+    credential = _CREDENTIALW()
+    credential.Type = CRED_TYPE_GENERIC
+    credential.TargetName = credential_target(normalized)
+    credential.Comment = f"{APP_NAME} saved login for {normalized}"
+    credential.CredentialBlobSize = len(payload)
+    credential.CredentialBlob = ctypes.cast(blob, ctypes.POINTER(ctypes.c_ubyte))
+    credential.Persist = CRED_PERSIST_LOCAL_MACHINE
+    credential.UserName = username
+    if not _cred_write(ctypes.byref(credential), 0):
+        error = ctypes.get_last_error()
+        raise OSError(error, "写入 Windows 凭据失败")
+    return True
+
+
+def delete_site_credentials(site):
+    if not _cred_delete:
+        return False
+    if _cred_delete(credential_target(site), CRED_TYPE_GENERIC, 0):
+        return True
+    error = ctypes.get_last_error()
+    if error == ERROR_NOT_FOUND:
+        return False
+    raise OSError(error, "删除 Windows 凭据失败")
+
+
+def has_site_credentials(site):
+    credential = read_site_credentials(site)
+    return bool(credential and credential.get("password"))
 
 
 def bundled_root():
@@ -213,6 +352,8 @@ def normalize_saved_site_record(item):
     site = str(record.get("site") or "")
     record["name"] = str(record.get("name") or site)
     record["auto_refresh"] = True
+    record["remember_credentials"] = bool(record.get("remember_credentials", True))
+    record["auto_login"] = bool(record.get("auto_login", True)) and record["remember_credentials"]
     record["reauth_required"] = bool(
         record.get("reauth_required") or record.get("last_status") == "reauth_required"
     )
@@ -226,7 +367,12 @@ def annotate_saved_sites(sites):
     for item in sites:
         if not isinstance(item, dict):
             continue
-        annotated.append(normalize_saved_site_record(item))
+        record = normalize_saved_site_record(item)
+        try:
+            record["credentials_saved"] = has_site_credentials(record.get("site", ""))
+        except Exception:
+            record["credentials_saved"] = False
+        annotated.append(record)
     return annotated
 
 
@@ -563,6 +709,148 @@ COLLECTOR_JS = r"""
 """
 
 
+CREDENTIAL_HELPER_JS = r"""
+(function applyCredentials(credentials) {
+  const isVisible = (element) => {
+    if (!element || element.disabled || element.readOnly) return false;
+    const style = window.getComputedStyle(element);
+    const rect = element.getBoundingClientRect();
+    return style.display !== 'none' && style.visibility !== 'hidden' && rect.width > 0 && rect.height > 0;
+  };
+  const passwordInputs = [...document.querySelectorAll('input[type="password"]')].filter(isVisible);
+  if (passwordInputs.length !== 1) {
+    return { loginForm: passwordInputs.length > 0, ambiguous: passwordInputs.length > 1 };
+  }
+
+  const passwordInput = passwordInputs[0];
+  const form = passwordInput.form || passwordInput.closest('form');
+  const scope = form || document;
+  const candidates = [...scope.querySelectorAll('input')].filter((input) => (
+    input !== passwordInput
+    && isVisible(input)
+    && ['text', 'email', 'tel', ''].includes(String(input.type || '').toLowerCase())
+  ));
+  const usernameInput = candidates.find((input) => /^(username|email)$/i.test(input.autocomplete || ''))
+    || candidates.find((input) => input.type === 'email')
+    || candidates.find((input) => /user|account|login|email|mail|phone|mobile/i.test(
+      `${input.name || ''} ${input.id || ''} ${input.placeholder || ''}`
+    ))
+    || candidates[0]
+    || null;
+  const loginUrl = /(?:^|[/#?&=_-])(?:login|signin|sign-in|auth|authorize)(?:$|[/#?&=_-])/i.test(location.href);
+  const passwordMode = String(passwordInput.autocomplete || '').toLowerCase();
+  const likelyLogin = loginUrl || Boolean(usernameInput) || passwordMode === 'current-password';
+  if (!likelyLogin || passwordMode === 'new-password') {
+    return { loginForm: true, ambiguous: true };
+  }
+
+  const setValue = (input, value) => {
+    if (!input || !value || input.value) return false;
+    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+    if (setter) setter.call(input, value);
+    else input.value = value;
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    input.dispatchEvent(new Event('change', { bubbles: true }));
+    return true;
+  };
+
+  let filled = false;
+  if (credentials) {
+    filled = setValue(usernameInput, credentials.username || '') || filled;
+    filled = setValue(passwordInput, credentials.password || '') || filled;
+  }
+
+  const save = () => {
+    const password = passwordInput.value || '';
+    if (!password) return;
+    const username = usernameInput?.value || '';
+    try {
+      const api = window.pywebview && window.pywebview.api;
+      if (api && typeof api.save_credentials === 'function') {
+        Promise.resolve(api.save_credentials(username, password)).catch(() => {});
+      }
+    } catch {}
+  };
+
+  if (!passwordInput.dataset.sub2apiCredentialHook) {
+    passwordInput.dataset.sub2apiCredentialHook = '1';
+    passwordInput.addEventListener('change', save);
+    passwordInput.addEventListener('blur', save);
+    passwordInput.addEventListener('keydown', (event) => {
+      if (event.key === 'Enter') save();
+    });
+  }
+  if (form && !form.dataset.sub2apiCredentialHook) {
+    form.dataset.sub2apiCredentialHook = '1';
+    form.addEventListener('submit', save, true);
+  }
+
+  const captchaSelector = [
+    'iframe[src*="captcha" i]',
+    'iframe[src*="challenge" i]',
+    'iframe[src*="turnstile" i]',
+    '[class*="captcha" i]',
+    '[id*="captcha" i]',
+    '[class*="turnstile" i]',
+    '[id*="turnstile" i]',
+  ].join(',');
+  const hasCaptcha = [...document.querySelectorAll(captchaSelector)].some(isVisible);
+  const hasOtp = [...scope.querySelectorAll('input')].some((input) => (
+    isVisible(input)
+    && (
+      String(input.autocomplete || '').toLowerCase() === 'one-time-code'
+      || /^(otp|totp|code|verification.?code|verify.?code)$/i.test(input.name || input.id || '')
+      || /验证码|动态码|一次性密码/i.test(input.placeholder || '')
+    )
+  ));
+  const requiredUnchecked = [...scope.querySelectorAll('input[type="checkbox"][required]')]
+    .some((input) => isVisible(input) && !input.checked);
+  const buttons = [...scope.querySelectorAll('button, input[type="submit"]')].filter(isVisible);
+  const submitButtons = buttons.filter((button) => {
+    const type = String(button.type || '').toLowerCase();
+    const label = String(button.innerText || button.value || button.getAttribute('aria-label') || '').trim();
+    return type === 'submit' || /^(登录|登錄|log\s*in|sign\s*in|继续|繼續|continue)$/i.test(label);
+  });
+  const submitButton = submitButtons.length === 1 ? submitButtons[0] : null;
+  const canAutoSubmit = Boolean(
+    credentials?.autoLogin
+    && credentials?.allowAutoLogin
+    && passwordInput.value
+    && (!usernameInput || usernameInput.value)
+    && !hasCaptcha
+    && !hasOtp
+    && !requiredUnchecked
+    && submitButton
+    && !window.__sub2apiAutoLoginPending
+  );
+  let autoSubmitted = false;
+  if (canAutoSubmit) {
+    window.__sub2apiAutoLoginPending = true;
+    autoSubmitted = true;
+    save();
+    window.setTimeout(() => {
+      try {
+        if (form?.requestSubmit) form.requestSubmit(submitButton);
+        else submitButton.click();
+      } catch {
+        submitButton.click();
+      }
+    }, 350);
+  }
+
+  return {
+    loginForm: true,
+    ambiguous: false,
+    username: usernameInput?.value || '',
+    password: passwordInput.value || '',
+    filled,
+    autoSubmitted,
+    blockedByChallenge: hasCaptcha || hasOtp || requiredUnchecked,
+  };
+})(__CREDENTIALS__)
+"""
+
+
 CONTROL_HTML = r"""<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -787,8 +1075,17 @@ CONTROL_HTML = r"""<!doctype html>
         <input id="includeGroupsInput" type="checkbox" checked />
         分组行
       </label>
+      <label class="toggle">
+        <input id="rememberCredentialsInput" type="checkbox" checked />
+        保存密码
+      </label>
+      <label class="toggle">
+        <input id="autoLoginInput" type="checkbox" checked />
+        自动登录
+      </label>
       <button id="saveSiteBtn" type="button">保存站点</button>
       <button id="deleteSiteBtn" type="button">删除站点</button>
+      <button id="clearCredentialsBtn" type="button">清除密码</button>
       <button id="openSiteBtn" type="button">WebView登录</button>
       <button id="captureBtn" type="button" class="primary">WebView抓取</button>
       <button id="updateAllBtn" type="button">更新全部</button>
@@ -871,10 +1168,13 @@ CONTROL_HTML = r"""<!doctype html>
     const intervalHoursInput = document.querySelector('#intervalHoursInput');
     const apiBaseInput = document.querySelector('#apiBaseInput');
     const includeGroupsInput = document.querySelector('#includeGroupsInput');
+    const rememberCredentialsInput = document.querySelector('#rememberCredentialsInput');
+    const autoLoginInput = document.querySelector('#autoLoginInput');
     const openSiteBtn = document.querySelector('#openSiteBtn');
     const captureBtn = document.querySelector('#captureBtn');
     const saveSiteBtn = document.querySelector('#saveSiteBtn');
     const deleteSiteBtn = document.querySelector('#deleteSiteBtn');
+    const clearCredentialsBtn = document.querySelector('#clearCredentialsBtn');
     const updateAllBtn = document.querySelector('#updateAllBtn');
     const exportCsvBtn = document.querySelector('#exportCsvBtn');
     const exportJsonBtn = document.querySelector('#exportJsonBtn');
@@ -1133,8 +1433,9 @@ CONTROL_HTML = r"""<!doctype html>
         const next = site.next_run ? ` · 下次 ${formatDateTime(site.next_run)}` : '';
         const statusLabels = { ok: '正常', error: '失败', reauth_required: '需重新授权' };
         const status = site.last_status ? ` · ${statusLabels[site.last_status] || site.last_status}` : '';
+        const credential = site.credentials_saved ? ' · 已保存密码' : '';
         const name = site.name && site.name !== site.site ? `${site.name} · ${site.site}` : site.site;
-        const label = `${name}${interval}${next}${status}`;
+        const label = `${name}${interval}${next}${status}${credential}`;
         return `<option value="${escapeHtml(site.site)}">${escapeHtml(label)}</option>`;
       }).join('');
     }
@@ -1198,6 +1499,8 @@ CONTROL_HTML = r"""<!doctype html>
       noteTouched = false;
       apiBaseInput.value = site.api_base || '/api/v1';
       intervalHoursInput.value = site.interval_minutes ? String(Math.round(site.interval_minutes / 60 * 100) / 100) : '3';
+      rememberCredentialsInput.checked = site.remember_credentials !== false;
+      autoLoginInput.checked = site.auto_login !== false && rememberCredentialsInput.checked;
     }
 
     function syncDefaultNote(force = false) {
@@ -1215,7 +1518,9 @@ CONTROL_HTML = r"""<!doctype html>
         siteNameInput.value,
         siteInput.value,
         apiBaseInput.value,
-        intervalHoursInput.value
+        intervalHoursInput.value,
+        rememberCredentialsInput.checked,
+        autoLoginInput.checked
       );
       if (!result.ok) {
         log(result.error);
@@ -1243,7 +1548,22 @@ CONTROL_HTML = r"""<!doctype html>
         setTimeout(startNextReauth, 0);
       }
       renderSavedSites();
-      log(`已删除站点：${result.site}`);
+      log(result.credentials_deleted
+        ? `已删除站点及其保存密码：${result.site}`
+        : `已删除站点：${result.site}`);
+    }
+
+    async function clearCredentials() {
+      const site = siteInput.value || savedSiteSelect.value;
+      const result = await window.pywebview.api.clear_credentials(site);
+      if (!result.ok) {
+        log(result.error);
+        return;
+      }
+      savedSites = result.saved_sites || savedSites;
+      renderSavedSites();
+      savedSiteSelect.value = result.site;
+      log(result.deleted ? `已清除站点密码：${result.site}` : `该站点没有已保存密码：${result.site}`);
     }
 
     function stopLoginAutoCapture() {
@@ -1500,8 +1820,15 @@ CONTROL_HTML = r"""<!doctype html>
     typeFilterSelect.addEventListener('change', render);
     maxRateInput.addEventListener('input', render);
     priceOnlyInput.addEventListener('change', render);
+    rememberCredentialsInput.addEventListener('change', () => {
+      if (!rememberCredentialsInput.checked) autoLoginInput.checked = false;
+    });
+    autoLoginInput.addEventListener('change', () => {
+      if (autoLoginInput.checked) rememberCredentialsInput.checked = true;
+    });
     saveSiteBtn.addEventListener('click', saveSite);
     deleteSiteBtn.addEventListener('click', deleteSite);
+    clearCredentialsBtn.addEventListener('click', clearCredentials);
     openSiteBtn.addEventListener('click', openSite);
     captureBtn.addEventListener('click', capture);
     updateAllBtn.addEventListener('click', updateAllSaved);
@@ -1515,12 +1842,22 @@ CONTROL_HTML = r"""<!doctype html>
 """
 
 
+class BrowserCredentialBridge:
+    def __init__(self, api):
+        self.api = api
+
+    def save_credentials(self, username="", password=""):
+        return self.api.save_browser_credentials(username, password)
+
+
 class PriceAppApi:
     def __init__(self, site=""):
         self.site = normalize_site(site) if str(site or "").strip() else ""
         self.rows = []
         self.browser_window = None
         self.controller_window = None
+        self.credential_bridge = BrowserCredentialBridge(self)
+        self.auto_login_attempts = {}
         self.browser_lock = threading.Lock()
         self.update_lock = threading.Lock()
         self.scheduler_stop = threading.Event()
@@ -1554,6 +1891,7 @@ class PriceAppApi:
                 self.attach_browser_window(webview.create_window(
                     "目标站点 WebView 登录",
                     url=url or BLANK_PAGE,
+                    js_api=self.credential_bridge,
                     width=1120,
                     height=820,
                     min_size=(760, 520),
@@ -1601,15 +1939,22 @@ class PriceAppApi:
         site,
         api_base=API_BASE,
         interval_hours=3,
+        remember_credentials=True,
+        auto_login=True,
         auto_refresh=True,
     ):
         try:
             normalized = normalize_site(site)
+            if not remember_credentials:
+                delete_site_credentials(normalized)
+                self.auto_login_attempts.pop(normalized, None)
             saved = self._upsert_saved_site(
                 name,
                 normalized,
                 api_base,
                 interval_hours,
+                remember_credentials,
+                auto_login,
             )
             return {"ok": True, "site": normalized, "saved_sites": annotate_saved_sites(saved)}
         except Exception as exc:
@@ -1618,9 +1963,45 @@ class PriceAppApi:
     def delete_site(self, site):
         try:
             normalized = normalize_site(site)
+            credentials_deleted = delete_site_credentials(normalized)
             saved = [item for item in load_saved_sites() if item.get("site") != normalized]
             write_saved_sites(saved)
-            return {"ok": True, "site": normalized, "saved_sites": annotate_saved_sites(saved)}
+            self.auto_login_attempts.pop(normalized, None)
+            return {
+                "ok": True,
+                "site": normalized,
+                "credentials_deleted": credentials_deleted,
+                "saved_sites": annotate_saved_sites(saved),
+            }
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+    def clear_credentials(self, site):
+        try:
+            normalized = normalize_site(site)
+            deleted = delete_site_credentials(normalized)
+            self.auto_login_attempts.pop(normalized, None)
+            return {
+                "ok": True,
+                "site": normalized,
+                "deleted": deleted,
+                "saved_sites": annotate_saved_sites(load_saved_sites()),
+            }
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+    def save_browser_credentials(self, username="", password=""):
+        try:
+            if not self.site:
+                raise RuntimeError("当前没有选择站点")
+            current_url = self.browser_window.get_current_url() if self.browser_window else ""
+            if not self._same_site_host(self.site, current_url):
+                raise RuntimeError("当前登录页与所选站点不一致，已拒绝保存密码")
+            record = self._record_for_site(self.site, API_BASE)
+            if record.get("remember_credentials") is False:
+                return {"ok": True, "site": self.site, "ignored": True}
+            write_site_credentials(self.site, username, password)
+            return {"ok": True, "site": self.site}
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
 
@@ -1628,6 +2009,7 @@ class PriceAppApi:
         try:
             self.site = normalize_site(site)
             self._ensure_browser_window(self.site, visible=True)
+            self._start_credential_helper(self.site)
             return {"ok": True, "site": self.site}
         except Exception as exc:
             error = str(exc)
@@ -1645,6 +2027,9 @@ class PriceAppApi:
                 self._ensure_browser_window(visible=False)
             else:
                 self._ensure_browser_window(self.site, visible=False)
+            credential_state = self._prepare_login_credentials(self.site)
+            if credential_state.get("autoSubmitted"):
+                self._wait_for_auto_login(self.site)
             base = str(api_base or API_BASE).strip()
             if not base.startswith("/"):
                 base = f"/{base}"
@@ -1662,6 +2047,7 @@ class PriceAppApi:
             fresh_rows = result.get("rows") or []
             if not self._has_price_rows(fresh_rows):
                 raise RuntimeError(self._rows_error_message(fresh_rows) or "还没有获取到价格，请确认已完成登录")
+            self.auto_login_attempts.pop(self.site, None)
             self.rows = merge_price_rows(load_latest_rows(), fresh_rows)
             snapshot = write_price_snapshot(self.rows, {
                 "site_count": 1,
@@ -1817,6 +2203,9 @@ class PriceAppApi:
             self.site = site
             self._ensure_browser_window(site, visible=False)
             self._wait_webview_ready(site, timeout=45)
+            credential_state = self._prepare_login_credentials(site)
+            if credential_state.get("autoSubmitted"):
+                self._wait_for_auto_login(site)
             options = {
                 "base": base,
                 "includeGroups": bool(include_groups),
@@ -1830,6 +2219,7 @@ class PriceAppApi:
                 raise RuntimeError(result.get("message") or json.dumps(result, ensure_ascii=False))
             if not self._has_price_rows(result.get("rows") or []):
                 raise RuntimeError(self._rows_error_message(result.get("rows") or []) or "未获取到价格")
+            self.auto_login_attempts.pop(site, None)
             result["ok"] = True
             return result
         except Exception as exc:
@@ -1853,6 +2243,84 @@ class PriceAppApi:
                 }],
                 "error": error,
             }
+
+    @staticmethod
+    def _same_site_host(site, current_url):
+        try:
+            expected = urlparse(normalize_site(site))
+            current = urlparse(str(current_url or ""))
+            return (
+                expected.scheme in ("http", "https")
+                and current.scheme in ("http", "https")
+                and expected.netloc.lower() == current.netloc.lower()
+            )
+        except ValueError:
+            return False
+
+    def _start_credential_helper(self, site):
+        normalized = normalize_site(site)
+
+        def worker():
+            try:
+                self._wait_webview_ready(normalized, timeout=30)
+                if self.site == normalized:
+                    self._prepare_login_credentials(normalized)
+            except Exception:
+                return
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _prepare_login_credentials(self, site):
+        try:
+            normalized = normalize_site(site)
+            if self.site != normalized or not self.browser_window:
+                return {"loginForm": False}
+            current_url = self.browser_window.get_current_url() or ""
+            if not self._same_site_host(normalized, current_url):
+                return {"loginForm": False}
+            record = self._record_for_site(normalized, API_BASE)
+            if record.get("remember_credentials") is False:
+                return {"loginForm": False}
+            credential = read_site_credentials(normalized)
+            if credential:
+                last_attempt = float(self.auto_login_attempts.get(normalized) or 0)
+                credential = {
+                    **credential,
+                    "autoLogin": bool(record.get("auto_login", True)),
+                    "allowAutoLogin": time.time() - last_attempt >= 120,
+                }
+            script = CREDENTIAL_HELPER_JS.replace(
+                "__CREDENTIALS__",
+                json.dumps(credential, ensure_ascii=False) if credential else "null",
+            )
+            result = self.browser_window.evaluate_js(script)
+            if isinstance(result, dict) and result.get("autoSubmitted"):
+                self.auto_login_attempts[normalized] = time.time()
+            if (
+                isinstance(result, dict)
+                and result.get("loginForm")
+                and not result.get("ambiguous")
+                and result.get("password")
+            ):
+                write_site_credentials(
+                    normalized,
+                    result.get("username") or "",
+                    result.get("password") or "",
+                )
+            return result if isinstance(result, dict) else {"loginForm": False}
+        except Exception:
+            return {"loginForm": False}
+
+    def _wait_for_auto_login(self, site, timeout=15):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            time.sleep(0.5)
+            state = self._prepare_login_credentials(site)
+            if not state.get("loginForm"):
+                return True
+            if state.get("blockedByChallenge"):
+                return False
+        return False
 
     def _wait_webview_ready(self, site, timeout=45):
         expected_origin = urlparse(site).netloc
@@ -1884,6 +2352,8 @@ class PriceAppApi:
             "browser_mode": "webview",
             "interval_minutes": 180,
             "auto_refresh": True,
+            "remember_credentials": True,
+            "auto_login": True,
             "next_run": now.isoformat(),
         }
 
@@ -1966,7 +2436,17 @@ class PriceAppApi:
                 current_url = ""
             try:
                 has_password_input = bool(self.browser_window.evaluate_js(
-                    "Boolean(document.querySelector('input[type=\"password\"]'))"
+                    "(() => {"
+                    "const visible = e => { const r=e.getBoundingClientRect(); const s=getComputedStyle(e); "
+                    "return !e.disabled && r.width>0 && r.height>0 && s.display!=='none' && s.visibility!=='hidden'; };"
+                    "const p=[...document.querySelectorAll('input[type=\"password\"]')].filter(visible);"
+                    "if(p.length!==1 || String(p[0].autocomplete||'').toLowerCase()==='new-password') return false;"
+                    "const scope=p[0].form||document;"
+                    "const user=[...scope.querySelectorAll('input')].some(i => i!==p[0] && visible(i) "
+                    "&& ['text','email','tel',''].includes(String(i.type||'').toLowerCase()));"
+                    "return user || String(p[0].autocomplete||'').toLowerCase()==='current-password' "
+                    "|| /(?:^|[/#?&=_-])(?:login|signin|sign-in|auth|authorize)(?:$|[/#?&=_-])/i.test(location.href);"
+                    "})()"
                 ))
             except Exception:
                 has_password_input = False
@@ -2050,7 +2530,15 @@ class PriceAppApi:
             subprocess.Popen(["explorer", f"/select,{file_path}"])
 
     @staticmethod
-    def _upsert_saved_site(name, site, api_base, interval_hours=3, auto_refresh=True):
+    def _upsert_saved_site(
+        name,
+        site,
+        api_base,
+        interval_hours=3,
+        remember_credentials=True,
+        auto_login=True,
+        auto_refresh=True,
+    ):
         saved = load_saved_sites()
         normalized_base = str(api_base or API_BASE).strip() or API_BASE
         if not normalized_base.startswith("/"):
@@ -2066,6 +2554,8 @@ class PriceAppApi:
             "browser_mode": "webview",
             "interval_minutes": interval,
             "auto_refresh": True,
+            "remember_credentials": bool(remember_credentials),
+            "auto_login": bool(auto_login) and bool(remember_credentials),
             "created_at": previous.get("created_at") or now,
             "last_run": previous.get("last_run", ""),
             "last_status": previous.get("last_status", ""),
@@ -2110,6 +2600,7 @@ def main():
     browser = webview.create_window(
         "目标站点 WebView 登录",
         url=site or BLANK_PAGE,
+        js_api=api.credential_bridge,
         width=1120,
         height=820,
         min_size=(760, 520),
