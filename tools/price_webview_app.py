@@ -5,8 +5,11 @@ import csv
 import hashlib
 import io
 import json
+import logging
+from logging.handlers import RotatingFileHandler
 import os
 import pathlib
+import queue
 import random
 import re
 import subprocess
@@ -14,10 +17,10 @@ import sys
 import threading
 import time
 from ctypes import wintypes
-from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timedelta, timezone
 from urllib.parse import urlparse, urlunparse
 
+import psutil
 import webview
 
 
@@ -68,6 +71,10 @@ OUTPUT_FIELDS = [
 
 
 APP_NAME = "Sub2APIPriceMonitor"
+APP_VERSION = "0.1.8"
+APP_WINDOW_TITLE = "Sub2API 中转站比价"
+LOGGER = logging.getLogger(APP_NAME)
+SHUTDOWN_JOIN_TIMEOUT_SECONDS = 1.0
 
 
 AUTH_ERROR_PATTERNS = (
@@ -103,6 +110,10 @@ ERROR_ALREADY_EXISTS = 183
 APP_MUTEX_NAME = f"Local\\{APP_NAME}.SingleInstance"
 _APP_MUTEX_HANDLE = None
 MAX_SITE_WORKERS = 2
+
+
+class AppShutdownRequested(RuntimeError):
+    pass
 
 ERROR_LABELS = {
     "reauth_required": "登录/会话已失效",
@@ -285,6 +296,27 @@ def has_site_credentials(site):
     return bool(credential and credential.get("password"))
 
 
+def focus_existing_instance():
+    if os.name != "nt":
+        return False
+    user32 = ctypes.windll.user32
+    find_window = user32.FindWindowW
+    find_window.argtypes = [wintypes.LPCWSTR, wintypes.LPCWSTR]
+    find_window.restype = wintypes.HWND
+    show_window = user32.ShowWindow
+    show_window.argtypes = [wintypes.HWND, ctypes.c_int]
+    show_window.restype = wintypes.BOOL
+    set_foreground_window = user32.SetForegroundWindow
+    set_foreground_window.argtypes = [wintypes.HWND]
+    set_foreground_window.restype = wintypes.BOOL
+    handle = find_window(None, APP_WINDOW_TITLE)
+    if not handle:
+        return False
+    show_window(handle, 9)
+    set_foreground_window(handle)
+    return True
+
+
 def acquire_single_instance():
     global _APP_MUTEX_HANDLE
     if os.name != "nt":
@@ -301,12 +333,13 @@ def acquire_single_instance():
         return True
     if ctypes.get_last_error() == ERROR_ALREADY_EXISTS:
         close_handle(handle)
-        ctypes.windll.user32.MessageBoxW(
-            None,
-            "Sub2API 中转站比价已经在运行。",
-            "Sub2API 中转站比价",
-            0x40,
-        )
+        if not focus_existing_instance():
+            ctypes.windll.user32.MessageBoxW(
+                None,
+                "Sub2API 中转站比价已经在运行。",
+                APP_WINDOW_TITLE,
+                0x40,
+            )
         return False
     _APP_MUTEX_HANDLE = handle
     return True
@@ -367,6 +400,121 @@ def output_dir():
     return path
 
 
+def webview_profile_dir():
+    return output_dir() / "price-webview-profile"
+
+
+def log_path():
+    path = output_dir() / "logs"
+    path.mkdir(parents=True, exist_ok=True)
+    return path / "app.log"
+
+
+def redact_log_text(value):
+    text = str(value or "")
+    text = re.sub(
+        r"(?i)(bearer\s+)[A-Za-z0-9._~+\-/]+=*",
+        r"\1<redacted>",
+        text,
+    )
+    return re.sub(r"\bsk-[A-Za-z0-9_-]{8,}\b", "sk-<redacted>", text)
+
+
+class RedactingFormatter(logging.Formatter):
+    def format(self, record):
+        return redact_log_text(super().format(record))
+
+
+def configure_logging():
+    if any(getattr(handler, "sub2api_handler", False) for handler in LOGGER.handlers):
+        return
+    handler = RotatingFileHandler(
+        log_path(),
+        maxBytes=1_000_000,
+        backupCount=3,
+        encoding="utf-8",
+    )
+    handler.sub2api_handler = True
+    handler.setFormatter(RedactingFormatter(
+        "%(asctime)s %(levelname)s %(threadName)s %(message)s"
+    ))
+    LOGGER.addHandler(handler)
+    LOGGER.setLevel(logging.INFO)
+    LOGGER.propagate = False
+
+
+def atomic_write_text(path, content, encoding="utf-8"):
+    destination = pathlib.Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(
+        f".{destination.name}.{os.getpid()}.{threading.get_ident()}.{time.time_ns()}.tmp"
+    )
+    try:
+        with temporary.open("w", encoding=encoding, newline="") as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(str(temporary), str(destination))
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def windows_path_aliases(path):
+    absolute = os.path.abspath(os.fspath(path))
+    aliases = {os.path.normcase(os.path.normpath(absolute))}
+    if os.name != "nt":
+        return aliases
+    kernel32 = ctypes.windll.kernel32
+    for function_name in ("GetLongPathNameW", "GetShortPathNameW"):
+        function = getattr(kernel32, function_name)
+        function.argtypes = [wintypes.LPCWSTR, wintypes.LPWSTR, wintypes.DWORD]
+        function.restype = wintypes.DWORD
+        buffer = ctypes.create_unicode_buffer(32768)
+        length = function(absolute, buffer, len(buffer))
+        if 0 < length < len(buffer):
+            aliases.add(os.path.normcase(os.path.normpath(buffer.value)))
+    return aliases
+
+
+def cleanup_webview_processes(profile_dir, reason):
+    if os.name != "nt":
+        return 0
+    profile_tokens = windows_path_aliases(profile_dir)
+    matches = []
+    for process in psutil.process_iter(["name", "cmdline"]):
+        try:
+            if str(process.info.get("name") or "").lower() != "msedgewebview2.exe":
+                continue
+            command_line = " ".join(process.info.get("cmdline") or [])
+            normalized_command_line = os.path.normcase(command_line)
+            if not any(token in normalized_command_line for token in profile_tokens):
+                continue
+            matches.append(process)
+        except (psutil.AccessDenied, psutil.NoSuchProcess, psutil.ZombieProcess):
+            continue
+    if not matches:
+        return 0
+
+    LOGGER.info("Cleaning %s app-owned WebView2 processes during %s", len(matches), reason)
+    for process in matches:
+        try:
+            process.terminate()
+        except (psutil.AccessDenied, psutil.NoSuchProcess):
+            continue
+    _, alive = psutil.wait_procs(matches, timeout=1.0)
+    for process in alive:
+        try:
+            process.kill()
+        except (psutil.AccessDenied, psutil.NoSuchProcess):
+            continue
+    if alive:
+        psutil.wait_procs(alive, timeout=0.5)
+    return len(matches)
+
+
 def default_output_path(site, fmt):
     return output_dir() / f"group-prices-{safe_host(site)}-{timestamp_slug()}.{fmt}"
 
@@ -398,6 +546,7 @@ def load_saved_sites():
         if isinstance(data, list):
             return data
     except Exception:
+        LOGGER.exception("Failed to load saved sites from %s", path)
         return []
     return []
 
@@ -474,7 +623,10 @@ def annotate_saved_sites(sites):
 def write_saved_sites(sites):
     path = saved_sites_path()
     normalized = [normalize_saved_site_record(item) for item in sites if isinstance(item, dict)]
-    path.write_text(json.dumps(normalized, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    atomic_write_text(
+        path,
+        json.dumps(normalized, ensure_ascii=False, indent=2) + "\n",
+    )
 
 
 def load_latest_rows():
@@ -486,6 +638,7 @@ def load_latest_rows():
         rows = data.get("rows") if isinstance(data, dict) else []
         return rows if isinstance(rows, list) else []
     except Exception:
+        LOGGER.exception("Failed to load latest prices from %s", path)
         return []
 
 
@@ -496,16 +649,12 @@ def write_price_snapshot(rows, summary):
         "summary": summary,
         "rows": rows,
     }
-    latest_prices_json_path().write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
-    latest_prices_csv_path().write_text(rows_to_csv(rows), encoding="utf-8-sig")
+    json_content = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
+    csv_content = rows_to_csv(rows)
     slug = generated_at.replace(":", "-").replace(".", "-")
-    (price_history_dir() / f"prices-{slug}.json").write_text(
-        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
+    atomic_write_text(price_history_dir() / f"prices-{slug}.json", json_content)
+    atomic_write_text(latest_prices_csv_path(), csv_content, encoding="utf-8-sig")
+    atomic_write_text(latest_prices_json_path(), json_content)
     return payload
 
 
@@ -972,6 +1121,7 @@ CONTROL_HTML = r"""<!doctype html>
     }
     h1 { margin: 0; font-size: 18px; }
     .status { color: #5b6877; font-size: 12px; }
+    .header-meta { display: flex; align-items: center; gap: 10px; white-space: nowrap; }
     .controls {
       display: grid;
       grid-template-columns: repeat(6, minmax(104px, 1fr));
@@ -1159,7 +1309,7 @@ CONTROL_HTML = r"""<!doctype html>
         <h1>Sub2API 中转站比价</h1>
         <div class="status" id="status">等待登录</div>
       </div>
-      <div class="status" id="rowCount">0 行</div>
+      <div class="header-meta status"><span>v__APP_VERSION__</span><span id="rowCount">0 行</span></div>
     </header>
 
     <section class="controls">
@@ -1841,7 +1991,27 @@ CONTROL_HTML = r"""<!doctype html>
       setState(auto ? '等待登录完成' : 'WebView 抓取中');
       if (!auto) log('开始从 WebView 当前登录页抓取价格接口');
       try {
-        const result = await window.pywebview.api.capture_prices(apiBaseInput.value, includeGroupsInput.checked, true);
+        const started = await window.pywebview.api.start_capture_prices(
+          apiBaseInput.value,
+          includeGroupsInput.checked,
+          true
+        );
+        let result = started;
+        if (started.ok) {
+          const jobId = started.job_id;
+          while (true) {
+            await new Promise((resolve) => setTimeout(resolve, 250));
+            const job = await window.pywebview.api.capture_status(jobId);
+            if (!job.ok) {
+              result = job;
+              break;
+            }
+            if (['completed', 'failed', 'cancelled'].includes(job.status)) {
+              result = job.result || { ok: false, error: job.message || '抓取任务未返回结果' };
+              break;
+            }
+          }
+        }
         if (!result.ok) {
           if (auto) {
             if (result.error_code === 'cloudflare_challenge') {
@@ -2096,11 +2266,18 @@ class PriceAppApi:
         self.data_lock = threading.RLock()
         self.state_lock = threading.RLock()
         self.job_lock = threading.RLock()
+        self.capture_job_lock = threading.RLock()
         self.update_lock = threading.Lock()
+        self.shutdown_lock = threading.RLock()
+        self.capture_threads_lock = threading.Lock()
         self.scheduler_stop = threading.Event()
         self.scheduler_thread = None
         self.scheduler_message = "自动检查未启动"
         self.browser_cancel_event = threading.Event()
+        self.shutdown_event = threading.Event()
+        self.shutdown_complete = threading.Event()
+        self.shutdown_thread = None
+        self.capture_threads = set()
         self.browser_operation_id = 0
         self.latest_generated_at = self._latest_generated_at()
         self.cached_saved_sites = annotate_saved_sites(load_saved_sites())
@@ -2108,6 +2285,16 @@ class PriceAppApi:
         self.update_thread = None
         self.update_job_sequence = 0
         self.update_job = self._idle_update_job()
+        self.capture_job_thread = None
+        self.capture_job_sequence = 0
+        self.capture_job = self._idle_capture_job()
+
+    def attach_controller_window(self, window):
+        self.controller_window = window
+        if window:
+            window.events.closing += self._on_controller_closing
+            window.events.closed += self._on_controller_closed
+        return window
 
     def attach_browser_window(self, window):
         self.browser_window = window
@@ -2134,6 +2321,132 @@ class PriceAppApi:
         if window is None or window is self.worker_windows[slot]:
             self.worker_windows[slot] = None
 
+    def _on_controller_closing(self, window=None):
+        self.request_shutdown("main_window_closing")
+
+    def _on_controller_closed(self, window=None):
+        if window is None or window is self.controller_window:
+            self.controller_window = None
+        self.request_shutdown("main_window_closed")
+
+    def _raise_if_shutting_down(self):
+        if self.shutdown_event.is_set():
+            raise AppShutdownRequested("APP_SHUTDOWN: 应用正在退出")
+
+    def _signal_shutdown(self, reason):
+        with self.shutdown_lock:
+            first_request = not self.shutdown_event.is_set()
+            self.shutdown_event.set()
+            self.scheduler_stop.set()
+            self.browser_cancel_event.set()
+            self.scheduler_message = "应用正在退出"
+        if first_request:
+            LOGGER.info("Shutdown requested: %s", reason)
+            with self.job_lock:
+                if self.update_job.get("status") == "running":
+                    self.update_job.update({
+                        "status": "cancelling",
+                        "message": "应用正在退出，正在取消更新",
+                        "current_site": "",
+                    })
+            with self.capture_job_lock:
+                if self.capture_job.get("status") == "running":
+                    self.capture_job.update({
+                        "status": "cancelling",
+                        "message": "应用正在退出，正在取消抓取",
+                    })
+        return first_request
+
+    def request_shutdown(self, reason="requested"):
+        self._signal_shutdown(reason)
+        with self.shutdown_lock:
+            if self.shutdown_thread and self.shutdown_thread.is_alive():
+                return
+            if self.shutdown_complete.is_set():
+                return
+            self.shutdown_thread = threading.Thread(
+                target=self._shutdown_sequence,
+                name="app-shutdown",
+                daemon=True,
+            )
+            self.shutdown_thread.start()
+
+    def _shutdown_sequence(self):
+        try:
+            self._destroy_auxiliary_windows()
+            self._join_background_threads(SHUTDOWN_JOIN_TIMEOUT_SECONDS)
+            self._destroy_auxiliary_windows()
+        except Exception:
+            LOGGER.exception("Unexpected error during shutdown")
+        finally:
+            self.shutdown_complete.set()
+            LOGGER.info("Shutdown cleanup completed")
+
+    def _destroy_auxiliary_windows(self):
+        browser_lock_acquired = self.browser_lock.acquire(timeout=0.05)
+        try:
+            browser = self.browser_window
+            self.browser_window = None
+        finally:
+            if browser_lock_acquired:
+                self.browser_lock.release()
+        if not browser_lock_acquired:
+            LOGGER.warning("Browser window lock was busy during shutdown; using fallback cleanup")
+
+        worker_lock_acquired = self.worker_window_lock.acquire(timeout=0.05)
+        try:
+            workers = [window for window in self.worker_windows if window]
+            self.worker_windows = [None] * MAX_SITE_WORKERS
+        finally:
+            if worker_lock_acquired:
+                self.worker_window_lock.release()
+        if not worker_lock_acquired:
+            LOGGER.warning("Worker window lock was busy during shutdown; using fallback cleanup")
+        for window in [browser, *workers]:
+            if not window:
+                continue
+            try:
+                window.destroy()
+            except Exception:
+                LOGGER.exception("Failed to destroy auxiliary WebView window")
+
+    def _join_background_threads(self, timeout):
+        deadline = time.monotonic() + max(0.0, float(timeout))
+        current = threading.current_thread()
+        with self.capture_threads_lock:
+            capture_threads = list(self.capture_threads)
+        threads = [
+            self.scheduler_thread,
+            self.update_thread,
+            self.capture_job_thread,
+            *capture_threads,
+        ]
+        seen = set()
+        for thread in threads:
+            if not thread or thread is current or id(thread) in seen:
+                continue
+            seen.add(id(thread))
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            thread.join(remaining)
+        lingering = [
+            thread.name
+            for thread in threads
+            if thread and thread is not current and thread.is_alive()
+        ]
+        if lingering:
+            LOGGER.warning("Daemon threads still stopping at exit: %s", ", ".join(lingering))
+
+    def shutdown(self, wait=True, timeout=SHUTDOWN_JOIN_TIMEOUT_SECONDS):
+        self.request_shutdown("main_finally")
+        thread = self.shutdown_thread
+        if wait and thread and thread is not threading.current_thread():
+            thread.join(max(0.0, float(timeout)) + 0.25)
+        if wait and not self.shutdown_complete.is_set():
+            LOGGER.warning("Shutdown cleanup exceeded %.1f seconds", float(timeout))
+        return self.shutdown_complete.is_set()
+
     @staticmethod
     def _window_alive(window):
         if not window:
@@ -2157,11 +2470,13 @@ class PriceAppApi:
         return False
 
     def _ensure_browser_window(self, url=None, visible=False):
+        self._raise_if_shutting_down()
         with self.browser_lock:
+            self._raise_if_shutting_down()
             if not self._browser_alive():
                 self.browser_cancel_event.clear()
                 self.browser_operation_id += 1
-                self.attach_browser_window(webview.create_window(
+                created_window = webview.create_window(
                     "目标站点 WebView 登录",
                     url=url or BLANK_PAGE,
                     js_api=self.credential_bridge,
@@ -2171,12 +2486,19 @@ class PriceAppApi:
                     hidden=not visible,
                     focus=visible,
                     text_select=True,
-                ))
+                )
+                if self.shutdown_event.is_set():
+                    try:
+                        created_window.destroy()
+                    finally:
+                        self._raise_if_shutting_down()
+                self.attach_browser_window(created_window)
             window = self.browser_window
             if url:
                 self.browser_cancel_event.clear()
                 self.browser_operation_id += 1
                 window.load_url(url)
+                self._raise_if_shutting_down()
             if visible:
                 try:
                     window.show()
@@ -2189,9 +2511,11 @@ class PriceAppApi:
             return window
 
     def _ensure_worker_window(self, slot, url=None):
+        self._raise_if_shutting_down()
         with self.worker_window_lock:
+            self._raise_if_shutting_down()
             if not self._worker_alive(slot):
-                self.attach_worker_window(webview.create_window(
+                created_window = webview.create_window(
                     f"后台价格抓取 {slot + 1}",
                     url=url or BLANK_PAGE,
                     width=960,
@@ -2200,10 +2524,17 @@ class PriceAppApi:
                     hidden=True,
                     focus=False,
                     text_select=False,
-                ), slot)
+                )
+                if self.shutdown_event.is_set():
+                    try:
+                        created_window.destroy()
+                    finally:
+                        self._raise_if_shutting_down()
+                self.attach_worker_window(created_window, slot)
             window = self.worker_windows[slot]
             if url:
                 window.load_url(url)
+                self._raise_if_shutting_down()
             return window
 
     def _hide_browser_window(self):
@@ -2228,6 +2559,17 @@ class PriceAppApi:
             "current_site": "",
             "summary": {},
             "error": "",
+        }
+
+    @staticmethod
+    def _idle_capture_job():
+        return {
+            "id": 0,
+            "status": "idle",
+            "message": "",
+            "started_at": "",
+            "completed_at": "",
+            "result": {},
         }
 
     def _cache_state(self, rows=None, saved_sites=None, generated_at=None):
@@ -2381,9 +2723,12 @@ class PriceAppApi:
             return {"ok": False, "error": str(exc)}
 
     def open_site(self, site):
+        if self.shutdown_event.is_set():
+            return {"ok": False, "shutting_down": True, "error": "应用正在退出"}
         if not self.interactive_operation_lock.acquire(blocking=False):
             return {"ok": False, "busy": True, "error": "登录窗口正在抓取，请稍后再试"}
         try:
+            self._raise_if_shutting_down()
             self.site = normalize_site(site)
             self._ensure_browser_window(self.site, visible=True)
             self._start_credential_helper(self.site)
@@ -2401,10 +2746,80 @@ class PriceAppApi:
         finally:
             self.interactive_operation_lock.release()
 
-    def capture_prices(self, api_base=API_BASE, include_groups=True, close_browser=True):
+    def start_capture_prices(self, api_base=API_BASE, include_groups=True, close_browser=True):
+        if self.shutdown_event.is_set():
+            return {"ok": False, "shutting_down": True, "error": "应用正在退出"}
+        with self.capture_job_lock:
+            if self.capture_job_thread and self.capture_job_thread.is_alive():
+                return {
+                    "ok": True,
+                    "accepted": False,
+                    "busy": True,
+                    "job_id": self.capture_job.get("id", 0),
+                    "status": self.capture_job.get("status", "running"),
+                }
+            self.capture_job_sequence += 1
+            job_id = self.capture_job_sequence
+            self.capture_job = {
+                "id": job_id,
+                "status": "running",
+                "message": "WebView 抓取中",
+                "started_at": datetime.now(timezone.utc).isoformat(),
+                "completed_at": "",
+                "result": {},
+            }
+            self.capture_job_thread = threading.Thread(
+                target=self._run_capture_job,
+                args=(job_id, api_base, bool(include_groups), bool(close_browser)),
+                name=f"interactive-capture-{job_id}",
+                daemon=True,
+            )
+            self.capture_job_thread.start()
+            return {
+                "ok": True,
+                "accepted": True,
+                "busy": False,
+                "job_id": job_id,
+                "status": "running",
+            }
+
+    def _run_capture_job(self, job_id, api_base, include_groups, close_browser):
+        try:
+            result = self._capture_prices_sync(api_base, include_groups, close_browser)
+        except Exception as exc:
+            LOGGER.exception("Interactive capture job %s failed", job_id)
+            result = {"ok": False, "error": str(exc)}
+        with self.capture_job_lock:
+            if self.capture_job.get("id") == job_id:
+                cancelled = self.shutdown_event.is_set()
+                self.capture_job.update({
+                    "status": "cancelled" if cancelled else "completed" if result.get("ok") else "failed",
+                    "message": "应用退出，抓取已取消" if cancelled else "抓取完成" if result.get("ok") else "抓取失败",
+                    "completed_at": datetime.now(timezone.utc).isoformat(),
+                    "result": result,
+                })
+            if self.capture_job_thread is threading.current_thread():
+                self.capture_job_thread = None
+
+    def capture_status(self, job_id=0):
+        try:
+            requested_id = int(job_id or 0)
+        except (TypeError, ValueError):
+            requested_id = 0
+        with self.capture_job_lock:
+            job = dict(self.capture_job)
+            job["result"] = dict(job.get("result") or {})
+        if requested_id and job.get("id") != requested_id:
+            return {"ok": False, "error": "抓取任务不存在或已过期"}
+        return {"ok": True, **job}
+
+    def _capture_prices_sync(self, api_base=API_BASE, include_groups=True, close_browser=True):
+        if self.shutdown_event.is_set():
+            return {"ok": False, "shutting_down": True, "error": "应用正在退出"}
         if not self.interactive_operation_lock.acquire(blocking=False):
             return {"ok": False, "busy": True, "error": "WebView 正在执行其他操作"}
         try:
+            self._raise_if_shutting_down()
             if not self.site:
                 raise RuntimeError("请先打开目标站点")
             if self.browser_cancel_event.is_set() and not self._browser_alive():
@@ -2428,6 +2843,7 @@ class PriceAppApi:
             }
             script = collector_js_template().replace("__OPTIONS__", json.dumps(options, ensure_ascii=False))
             result = self._evaluate_async(window, script, timeout=60)
+            self._raise_if_shutting_down()
             if not isinstance(result, dict):
                 raise RuntimeError(f"抓取脚本返回了异常结果：{result!r}")
             if "rows" not in result:
@@ -2484,6 +2900,7 @@ class PriceAppApi:
 
     def start_update_all_prices(self, reason="manual", only_due=False):
         try:
+            self._raise_if_shutting_down()
             with self.job_lock:
                 if self.update_thread and self.update_thread.is_alive():
                     return {
@@ -2542,6 +2959,7 @@ class PriceAppApi:
     def _run_update_job(self, job_id, sites, only_due):
         try:
             with self.update_lock:
+                self._raise_if_shutting_down()
                 result = self._run_site_records(
                     sites,
                     only_due=only_due,
@@ -2567,8 +2985,19 @@ class PriceAppApi:
                         "error": "",
                     })
             self.scheduler_message = message
+        except AppShutdownRequested:
+            with self.job_lock:
+                if self.update_job.get("id") == job_id:
+                    self.update_job.update({
+                        "status": "cancelled",
+                        "message": "应用退出，更新已取消",
+                        "completed_at": datetime.now(timezone.utc).isoformat(),
+                        "current_site": "",
+                        "error": "",
+                    })
         except Exception as exc:
             error = str(exc)
+            LOGGER.exception("Price update job %s failed", job_id)
             with self.job_lock:
                 if self.update_job.get("id") == job_id:
                     self.update_job.update({
@@ -2596,6 +3025,8 @@ class PriceAppApi:
             })
 
     def start_scheduler(self):
+        if self.shutdown_event.is_set():
+            return {"ok": False, "running": False, "shutting_down": True, "error": "应用正在退出"}
         if self.scheduler_thread and self.scheduler_thread.is_alive():
             return {"ok": True, "running": True}
         self.scheduler_stop.clear()
@@ -2621,14 +3052,75 @@ class PriceAppApi:
         }
 
     def _scheduler_loop(self):
-        while not self.scheduler_stop.wait(30):
+        while not self.shutdown_event.is_set() and not self.scheduler_stop.wait(30):
             result = self.start_update_all_prices("scheduler", True)
             if result.get("accepted"):
                 self.scheduler_message = "后台自动检查中"
             elif not result.get("ok"):
                 self.scheduler_message = f"自动检查失败：{result.get('error', '未知错误')}"
 
+    def _run_capture_tasks(self, records, worker_count):
+        tasks = queue.Queue()
+        results = queue.Queue()
+        for index, record in enumerate(records):
+            tasks.put((index, record))
+
+        def worker(slot):
+            current = threading.current_thread()
+            try:
+                while not self.shutdown_event.is_set():
+                    try:
+                        index, record = tasks.get_nowait()
+                    except queue.Empty:
+                        return
+                    try:
+                        self._raise_if_shutting_down()
+                        result = self._capture_site_webview(record, True, slot)
+                        results.put((index, record, result, None))
+                    except Exception as exc:
+                        results.put((index, record, None, exc))
+                        if isinstance(exc, AppShutdownRequested):
+                            return
+                    finally:
+                        tasks.task_done()
+            finally:
+                with self.capture_threads_lock:
+                    self.capture_threads.discard(current)
+
+        threads = [
+            threading.Thread(
+                target=worker,
+                args=(slot,),
+                name=f"site-capture-{slot + 1}",
+                daemon=True,
+            )
+            for slot in range(worker_count)
+        ]
+        with self.capture_threads_lock:
+            self.capture_threads.update(threads)
+        for thread in threads:
+            thread.start()
+
+        completed = 0
+        try:
+            while completed < len(records):
+                self._raise_if_shutting_down()
+                try:
+                    _, record, result, error = results.get(timeout=0.2)
+                except queue.Empty:
+                    if not any(thread.is_alive() for thread in threads):
+                        raise RuntimeError("后台抓取线程意外结束")
+                    continue
+                if error:
+                    raise error
+                completed += 1
+                yield record, result
+        finally:
+            for thread in threads:
+                thread.join(0.5)
+
     def _run_site_records(self, sites, only_due, progress_callback=None):
+        self._raise_if_shutting_down()
         due_sites = []
         for record in sites:
             if not record.get("site"):
@@ -2661,32 +3153,22 @@ class PriceAppApi:
         worker_count = min(MAX_SITE_WORKERS, len(due_sites))
         if progress_callback:
             progress_callback(0, len(due_sites), due_sites[0].get("site", ""))
-        with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix="site-capture") as executor:
-            futures = {
-                executor.submit(
-                    self._capture_site_webview,
-                    record,
-                    True,
-                    index % worker_count,
-                ): record
-                for index, record in enumerate(due_sites)
-            }
-            completed = 0
-            for future in as_completed(futures):
-                record = futures[future]
-                result = future.result()
-                rows = result.get("rows") or []
-                fresh_rows.extend(rows)
-                updated = self._site_status_record(record, result)
-                captured_updates[updated["site"]] = updated
-                if result.get("ok"):
-                    success_count += 1
-                else:
-                    error_count += 1
-                completed += 1
-                if progress_callback:
-                    progress_callback(completed, len(due_sites), record.get("site", ""))
+        completed = 0
+        for record, result in self._run_capture_tasks(due_sites, worker_count):
+            self._raise_if_shutting_down()
+            rows = result.get("rows") or []
+            fresh_rows.extend(rows)
+            updated = self._site_status_record(record, result)
+            captured_updates[updated["site"]] = updated
+            if result.get("ok"):
+                success_count += 1
+            else:
+                error_count += 1
+            completed += 1
+            if progress_callback:
+                progress_callback(completed, len(due_sites), record.get("site", ""))
 
+        self._raise_if_shutting_down()
         with self.data_lock:
             current_records = load_saved_sites()
             status_fields = (
@@ -2740,11 +3222,13 @@ class PriceAppApi:
         }
 
     def _capture_site_webview(self, record, include_groups=True, worker_slot=0):
+        self._raise_if_shutting_down()
         site = normalize_site(record.get("site", ""))
         base = self._normalized_api_base(record.get("api_base", API_BASE))
         with self.worker_operation_locks[worker_slot]:
             window = None
             try:
+                self._raise_if_shutting_down()
                 window = self._ensure_worker_window(worker_slot, site)
                 self._wait_webview_ready(window, site, timeout=30)
                 credential_state = self._prepare_login_credentials(site, window, allow_save=False)
@@ -2758,6 +3242,7 @@ class PriceAppApi:
                 }
                 script = collector_js_template().replace("__OPTIONS__", json.dumps(options, ensure_ascii=False))
                 result = self._evaluate_async(window, script, timeout=60)
+                self._raise_if_shutting_down()
                 if not isinstance(result, dict):
                     raise RuntimeError(f"WebView 抓取返回了异常结果：{result!r}")
                 if "rows" not in result:
@@ -2769,6 +3254,8 @@ class PriceAppApi:
                 self.auto_login_attempts.pop(site, None)
                 result["ok"] = True
                 return result
+            except AppShutdownRequested:
+                raise
             except Exception as exc:
                 now = datetime.now(timezone.utc).isoformat()
                 error = str(exc)
@@ -2809,12 +3296,15 @@ class PriceAppApi:
             return False
 
     def _start_credential_helper(self, site):
+        if self.shutdown_event.is_set():
+            return
         normalized = normalize_site(site)
 
         def worker():
             if not self.interactive_operation_lock.acquire(timeout=5):
                 return
             try:
+                self._raise_if_shutting_down()
                 window = self.browser_window
                 self._wait_webview_ready(window, normalized, timeout=30)
                 if self.site == normalized:
@@ -2828,6 +3318,7 @@ class PriceAppApi:
 
     def _prepare_login_credentials(self, site, window=None, allow_save=False):
         try:
+            self._raise_if_shutting_down()
             normalized = normalize_site(site)
             window = window or self.browser_window
             if not window:
@@ -2869,12 +3360,15 @@ class PriceAppApi:
                 )
                 self._mark_credentials_cached(normalized, True)
             return result if isinstance(result, dict) else {"loginForm": False}
+        except AppShutdownRequested:
+            raise
         except Exception:
             return {"loginForm": False}
 
     def _wait_for_auto_login(self, site, window, allow_save=False, timeout=15):
         deadline = time.time() + timeout
         while time.time() < deadline:
+            self._raise_if_shutting_down()
             if window is self.browser_window and self.browser_cancel_event.is_set():
                 raise RuntimeError("WINDOW_CLOSED: 登录窗口已关闭")
             if self._detect_cloudflare_challenge(window):
@@ -2888,12 +3382,14 @@ class PriceAppApi:
         return False
 
     def _wait_webview_ready(self, window, site, timeout=45):
+        self._raise_if_shutting_down()
         if not window:
             raise RuntimeError("WebView 窗口不可用")
         expected_origin = urlparse(site).netloc
         deadline = time.time() + timeout
         last_error = ""
         while time.time() < deadline:
+            self._raise_if_shutting_down()
             if window is self.browser_window and self.browser_cancel_event.is_set():
                 raise RuntimeError("WINDOW_CLOSED: 登录窗口已关闭")
             try:
@@ -3168,13 +3664,18 @@ class PriceAppApi:
                 if fmt == "json"
                 else rows_to_csv(self.rows)
             )
-            file_path.write_text(content, encoding="utf-8-sig" if fmt == "csv" else "utf-8")
+            atomic_write_text(
+                file_path,
+                content,
+                encoding="utf-8-sig" if fmt == "csv" else "utf-8",
+            )
             self._show_in_folder(file_path)
             return {"ok": True, "path": str(file_path)}
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
 
     def _evaluate_async(self, window, script, timeout):
+        self._raise_if_shutting_down()
         done = threading.Event()
         holder = {}
 
@@ -3187,6 +3688,7 @@ class PriceAppApi:
             return immediate
         deadline = time.time() + timeout
         while not done.is_set() and time.time() < deadline:
+            self._raise_if_shutting_down()
             if window is self.browser_window and self.browser_cancel_event.is_set():
                 raise RuntimeError("WINDOW_CLOSED: 登录窗口已关闭")
             if self._detect_cloudflare_challenge(window):
@@ -3259,45 +3761,64 @@ def parse_args():
 
 def main():
     if not acquire_single_instance():
-        return
-    args = parse_args()
-    site = normalize_site(args.site) if str(args.site or "").strip() else ""
-    api = PriceAppApi(site)
+        return 0
+    api = None
+    profile_dir = None
     try:
+        configure_logging()
+        args = parse_args()
+        site = normalize_site(args.site) if str(args.site or "").strip() else ""
+        api = PriceAppApi(site)
+        profile_dir = webview_profile_dir()
+        profile_dir.mkdir(parents=True, exist_ok=True)
+        cleanup_webview_processes(profile_dir, "startup")
+        LOGGER.info(
+            "Starting %s %s frozen=%s data_dir=%s",
+            APP_NAME,
+            APP_VERSION,
+            bool(getattr(sys, "frozen", False)),
+            output_dir(),
+        )
         controller = webview.create_window(
-            "Sub2API 中转站比价",
-            html=CONTROL_HTML,
+            APP_WINDOW_TITLE,
+            html=CONTROL_HTML.replace("__APP_VERSION__", APP_VERSION),
             js_api=api,
             width=980,
             height=760,
             min_size=(780, 560),
             text_select=True,
         )
-        browser = webview.create_window(
-            "目标站点 WebView 登录",
-            url=site or BLANK_PAGE,
-            js_api=api.credential_bridge,
-            width=1120,
-            height=820,
-            min_size=(760, 520),
-            hidden=True,
-            focus=False,
-            text_select=True,
-        )
-        api.controller_window = controller
-        api.attach_browser_window(browser)
+        api.attach_controller_window(controller)
 
-        profile_dir = output_dir() / "price-webview-profile"
-        profile_dir.mkdir(parents=True, exist_ok=True)
         webview.start(
             gui="edgechromium",
             debug=args.devtools,
             private_mode=False,
             storage_path=str(profile_dir),
         )
+        return 0
+    except Exception as exc:
+        LOGGER.exception("Fatal application error")
+        if os.name == "nt":
+            try:
+                diagnostic_path = str(log_path())
+            except Exception:
+                diagnostic_path = "本地日志目录不可用"
+            ctypes.windll.user32.MessageBoxW(
+                None,
+                f"应用发生错误，无法继续运行。\n\n{exc}\n\n日志：{diagnostic_path}",
+                APP_WINDOW_TITLE,
+                0x10,
+            )
+        return 1
     finally:
+        if api:
+            api.shutdown(wait=True)
+        if profile_dir:
+            cleanup_webview_processes(profile_dir, "shutdown")
         release_single_instance()
+        LOGGER.info("Application process exiting")
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

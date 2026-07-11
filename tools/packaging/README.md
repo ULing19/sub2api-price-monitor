@@ -29,8 +29,10 @@
 在仓库根目录运行：
 
 ```powershell
-.\tools\packaging\build_price_app.ps1
+.\tools\packaging\build_price_app.ps1 -Version 0.1.8
 ```
+
+构建脚本会校验 `APP_VERSION` 与传入版本一致，并把产品名称和版本号写入 Windows EXE 文件属性。版本不一致时会直接停止构建，避免误发旧二进制。
 
 默认生成单文件 exe：
 
