@@ -302,6 +302,44 @@ class PriceAppLifecycleTests(unittest.TestCase):
         self.assertEqual(result["site"], "https://new.example")
         self.assertEqual(browser.load_urls, ["https://new.example"])
 
+    def test_login_window_does_not_open_during_background_update(self):
+        api = self.new_api()
+        browser = FakeBrowserWindow()
+        api.attach_browser_window(browser)
+        api.update_thread = mock.Mock()
+        api.update_thread.is_alive.return_value = True
+
+        result = api.open_site("https://new.example")
+
+        self.assertFalse(result["ok"])
+        self.assertTrue(result["update_running"])
+        self.assertEqual(browser.load_urls, [])
+        self.assertFalse(api.login_session_active.is_set())
+        api.update_thread = None
+
+    def test_background_update_waits_for_manual_login_action(self):
+        api = self.new_api()
+        api.login_session_active.set()
+
+        result = api.start_update_all_prices("manual", False)
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["busy"])
+        self.assertTrue(result["login_active"])
+        self.assertFalse(result["accepted"])
+
+    def test_skip_login_clears_active_session(self):
+        api = self.new_api()
+        api.site = "https://current.example"
+        browser = FakeBrowserWindow()
+        api.attach_browser_window(browser)
+        api.login_session_active.set()
+
+        result = api.hide_login_webview()
+
+        self.assertTrue(result["ok"])
+        self.assertFalse(api.login_session_active.is_set())
+
     def test_refresh_login_webview_reloads_current_site(self):
         api = self.new_api()
         api.site = "https://current.example"

@@ -23,7 +23,7 @@ from ctypes import wintypes
 from datetime import datetime, timedelta, timezone
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse, urlunparse
-from urllib.request import Request, urlopen
+from urllib.request import ProxyHandler, Request, build_opener
 
 import psutil
 import webview
@@ -76,7 +76,7 @@ OUTPUT_FIELDS = [
 
 
 APP_NAME = "Sub2APIPriceMonitor"
-APP_VERSION = "0.1.12"
+APP_VERSION = "0.1.13"
 APP_WINDOW_TITLE = "Sub2API 中转站比价"
 LOGGER = logging.getLogger(APP_NAME)
 SHUTDOWN_JOIN_TIMEOUT_SECONDS = 1.0
@@ -1359,8 +1359,8 @@ CONTROL_HTML = r"""<!doctype html>
       <button id="deleteSiteBtn" type="button">删除站点</button>
       <button id="clearCredentialsBtn" type="button">清除密码</button>
       <button id="openSiteBtn" type="button">WebView登录</button>
-      <button id="refreshLoginBtn" type="button">刷新登录页</button>
-      <button id="hideLoginBtn" type="button">收起登录窗口</button>
+      <button id="refreshLoginBtn" type="button">手动刷新验证页</button>
+      <button id="hideLoginBtn" type="button">暂时跳过本站</button>
       <button id="captureBtn" type="button" class="primary">WebView抓取</button>
       <button id="updateAllBtn" type="button">更新全部</button>
       <button id="exportCsvBtn" type="button" disabled>导出 CSV</button>
@@ -1499,6 +1499,9 @@ CONTROL_HTML = r"""<!doctype html>
     let lastAutoCaptureError = '';
     let reauthQueue = [];
     let reauthActiveSite = '';
+    let updateRunning = false;
+    let observedUpdateId = 0;
+    const deferredReauthSites = new Set();
     let noteTouched = false;
     let lastAutoNote = '';
     const CATEGORY_ORDER = [
@@ -1952,6 +1955,7 @@ CONTROL_HTML = r"""<!doctype html>
     function enqueueReauthSites(sites) {
       for (const record of sites || []) {
         if (!record?.site || record.site === reauthActiveSite) continue;
+        if (deferredReauthSites.has(record.site)) continue;
         if (reauthQueue.some((item) => item.site === record.site)) continue;
         reauthQueue.push(record);
         log(`检测到站点授权失效：${reauthLabel(record)}`);
@@ -1962,7 +1966,7 @@ CONTROL_HTML = r"""<!doctype html>
     }
 
     async function startNextReauth() {
-      if (reauthActiveSite || loginAutoCaptureTimer || !reauthQueue.length) return;
+      if (updateRunning || reauthActiveSite || loginAutoCaptureTimer || !reauthQueue.length) return;
       const record = reauthQueue.shift();
       reauthActiveSite = record.site;
       const saved = savedSites.find((item) => item.site === record.site) || record;
@@ -1974,6 +1978,11 @@ CONTROL_HTML = r"""<!doctype html>
       if (!result.ok) {
         log(`重新授权窗口打开失败：${result.error}`);
         reauthActiveSite = '';
+        if (result.update_running) {
+          reauthQueue.unshift(record);
+          setTimeout(startNextReauth, 1000);
+          return;
+        }
         if (result.timeout) {
           reauthQueue.unshift(record);
           setState('重新授权窗口超时');
@@ -2025,6 +2034,7 @@ CONTROL_HTML = r"""<!doctype html>
         return;
       }
       siteInput.value = result.site;
+      deferredReauthSites.delete(result.site);
       render();
       setState('WebView 登录中');
       log(`已在 WebView 打开：${result.site}`);
@@ -2033,7 +2043,6 @@ CONTROL_HTML = r"""<!doctype html>
     }
 
     async function refreshLoginWebView() {
-      const mode = loginAutoCaptureMode || (reauthActiveSite ? 'reauth' : 'login');
       stopLoginAutoCapture();
       refreshLoginBtn.disabled = true;
       setState('正在刷新登录页');
@@ -2045,9 +2054,9 @@ CONTROL_HTML = r"""<!doctype html>
           return;
         }
         siteInput.value = result.site;
-        setState('WebView 登录中');
-        log(`已刷新 WebView 登录页：${result.site}`);
-        startLoginAutoCapture(mode);
+        setState('等待人工验证');
+        log(`已手动刷新验证页：${result.site}`);
+        log('请完成验证；完成后点击“WebView抓取”，应用不会自动刷新此页面。');
       } finally {
         refreshLoginBtn.disabled = false;
       }
@@ -2062,13 +2071,18 @@ CONTROL_HTML = r"""<!doctype html>
           log(result.error);
           return;
         }
+        const skippedSite = result.site || reauthActiveSite || siteInput.value;
+        if (skippedSite) {
+          deferredReauthSites.add(skippedSite);
+          reauthQueue = reauthQueue.filter((item) => item.site !== skippedSite);
+          log(`本轮已暂时跳过：${skippedSite}`);
+        }
         if (reauthActiveSite) {
-          log(`已暂缓重新授权：${reauthActiveSite}`);
           reauthActiveSite = '';
           setTimeout(startNextReauth, 500);
         }
-        setState('登录窗口已收起');
-        log('已收起 WebView 登录窗口，可以继续更新或登录其他站点。');
+        setState('已暂时跳过本站');
+        log('登录窗口已收起；本站在本轮更新中不会再次自动弹出。');
       } finally {
         hideLoginBtn.disabled = false;
       }
@@ -2104,17 +2118,24 @@ CONTROL_HTML = r"""<!doctype html>
         }
         if (!result.ok) {
           if (auto) {
-            if (result.error_code === 'cloudflare_challenge') {
+            if (['cloudflare_challenge', 'timeout', 'network_error'].includes(result.error_code)) {
               stopLoginAutoCapture();
-              setState('等待人工验证');
-              log(`${result.status_label || '需要人工验证'}：请在 WebView 中完成验证，验证后点击 WebView抓取。`);
+              setState('自动检测已暂停');
+              log(`${result.status_label || '页面异常'}：自动检测已暂停。`);
+              log('请手动点击“手动刷新验证页”“WebView抓取”或“暂时跳过本站”。');
               return false;
             }
             if (result.error_code === 'window_closed') {
               stopLoginAutoCapture();
-              if (reauthActiveSite) reauthActiveSite = '';
+              const skippedSite = reauthActiveSite || siteInput.value;
+              if (skippedSite) deferredReauthSites.add(skippedSite);
+              await window.pywebview.api.hide_login_webview();
+              if (reauthActiveSite) {
+                reauthQueue = reauthQueue.filter((item) => item.site !== reauthActiveSite);
+                reauthActiveSite = '';
+              }
               setState(result.status_label || '登录窗口已关闭');
-              log(`${result.status_label || '自动抓取已暂停'}：${result.error}`);
+              log(`${result.status_label || '自动抓取已暂停'}：本站在本轮已暂时跳过。`);
               setTimeout(startNextReauth, 500);
               return false;
             }
@@ -2171,8 +2192,13 @@ CONTROL_HTML = r"""<!doctype html>
         return;
       }
       if (result.busy) {
-        setState('更新已在运行');
-        log('已有更新任务正在运行，本次操作不会重复启动。');
+        if (result.login_active) {
+          setState('等待人工处理');
+          log('登录/验证窗口仍在处理，请先抓取成功或点击“暂时跳过本站”。');
+        } else {
+          setState('更新已在运行');
+          log('已有更新任务正在运行，本次操作不会重复启动。');
+        }
       } else if (result.accepted) {
         updateAllBtn.disabled = true;
         setState('后台更新中');
@@ -2200,7 +2226,6 @@ CONTROL_HTML = r"""<!doctype html>
     function applyRuntimeStatus(result) {
       savedSites = result.saved_sites || savedSites;
       renderSavedSites();
-      enqueueReauthSites(result.reauth_sites || []);
       if (result.rows_changed) {
         stateRevision = Number(result.revision) || stateRevision;
         latestGeneratedAt = result.latest_generated_at || latestGeneratedAt;
@@ -2213,6 +2238,12 @@ CONTROL_HTML = r"""<!doctype html>
 
       const update = result.update || {};
       const updating = update.status === 'running';
+      const updateId = Number(update.id) || 0;
+      if (updating && updateId && updateId !== observedUpdateId) {
+        observedUpdateId = updateId;
+        deferredReauthSites.clear();
+      }
+      updateRunning = updating;
       updateAllBtn.disabled = updating;
       if (updating) {
         const completed = Number(update.completed_sites) || 0;
@@ -2232,6 +2263,9 @@ CONTROL_HTML = r"""<!doctype html>
           setState('更新失败');
           log(update.error || update.message || '后台更新失败');
         }
+      }
+      if (!updating) {
+        enqueueReauthSites(result.reauth_sites || []);
       }
       if (!updating && result.running && !reauthActiveSite && !reauthQueue.length && !update.id) {
         stateBadge.textContent = '自动检查中';
@@ -2276,9 +2310,6 @@ CONTROL_HTML = r"""<!doctype html>
       } else {
         log('请输入目标站点地址，然后点击“WebView登录”。');
       }
-      enqueueReauthSites(savedSites.filter((item) => (
-        item.reauth_required || item.last_status === 'reauth_required'
-      )));
       await startAutoCheck();
       if (savedSites.length) {
         await updateAllSaved('startup');
@@ -2427,6 +2458,7 @@ class BrowserProcessManager:
         self.port = self._free_port()
         self.process = None
         self.ready_pid = None
+        self.opener = build_opener(ProxyHandler({}))
         self.lock = threading.RLock()
         self.generation = 0
 
@@ -2531,7 +2563,7 @@ class BrowserProcessManager:
             method="POST",
         )
         try:
-            with urlopen(request, timeout=max(0.2, float(timeout))) as response:
+            with self.opener.open(request, timeout=max(0.2, float(timeout))) as response:
                 result = json.loads(response.read().decode("utf-8"))
         except (HTTPError, URLError, TimeoutError, OSError, ValueError) as exc:
             raise RuntimeError(str(exc)) from exc
@@ -2776,6 +2808,7 @@ class PriceAppApi:
         self.scheduler_thread = None
         self.scheduler_message = "自动检查未启动"
         self.browser_cancel_event = threading.Event()
+        self.login_session_active = threading.Event()
         self.shutdown_event = threading.Event()
         self.shutdown_complete = threading.Event()
         self.shutdown_thread = None
@@ -3248,12 +3281,22 @@ class PriceAppApi:
             return {"ok": False, "busy": True, "error": "登录窗口正在抓取，请稍后再试"}
         try:
             self._raise_if_shutting_down()
+            with self.job_lock:
+                if self.update_thread and self.update_thread.is_alive():
+                    return {
+                        "ok": False,
+                        "busy": True,
+                        "update_running": True,
+                        "error": "后台更新仍在运行，请等待完成后再打开登录窗口",
+                    }
+                self.login_session_active.set()
             normalized = normalize_site(site)
             self._ensure_browser_window(normalized, visible=True)
             self.site = normalized
             self._start_credential_helper(normalized)
             return {"ok": True, "site": normalized}
         except Exception as exc:
+            self.login_session_active.clear()
             error = str(exc)
             failure = self._classify_capture_failure(error, self.browser_window)
             return {
@@ -3276,6 +3319,7 @@ class PriceAppApi:
             return {"ok": False, "busy": True, "error": "登录窗口仍在执行操作，请稍后再试"}
         try:
             self._raise_if_shutting_down()
+            self.login_session_active.set()
             window = self._ensure_browser_window(self.site, visible=True)
             self._start_credential_helper(self.site)
             return {"ok": True, "site": self.site, "operation_id": self.browser_operation_id}
@@ -3288,6 +3332,7 @@ class PriceAppApi:
         if self.shutdown_event.is_set():
             return {"ok": False, "shutting_down": True, "error": "应用正在退出"}
         self.browser_cancel_event.set()
+        self.login_session_active.clear()
         if not self._browser_alive():
             return {"ok": True, "hidden": False, "site": self.site}
         threading.Thread(
@@ -3426,6 +3471,7 @@ class PriceAppApi:
                 )
             if close_browser:
                 self._hide_browser_window()
+                self.login_session_active.clear()
             return {
                 "ok": True,
                 **result,
@@ -3454,6 +3500,14 @@ class PriceAppApi:
         try:
             self._raise_if_shutting_down()
             with self.job_lock:
+                if self.login_session_active.is_set():
+                    return {
+                        "ok": True,
+                        "accepted": False,
+                        "busy": True,
+                        "login_active": True,
+                        "update": dict(self.update_job),
+                    }
                 if self.update_thread and self.update_thread.is_alive():
                     return {
                         "ok": True,
