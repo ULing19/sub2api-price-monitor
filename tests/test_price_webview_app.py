@@ -241,6 +241,16 @@ class PriceAppLifecycleTests(unittest.TestCase):
             time.sleep(0.01)
         self.assertEqual(browser.hide_count, 1)
 
+    def test_stale_hide_does_not_hide_a_new_login_operation(self):
+        api = self.new_api()
+        browser = FakeBrowserWindow()
+        api.attach_browser_window(browser)
+        api.browser_operation_id = 2
+
+        api._hide_browser_window(operation_id=1)
+
+        self.assertEqual(browser.hide_count, 0)
+
     def test_missing_login_window_fails_without_dynamic_creation(self):
         api = self.new_api()
         with mock.patch.object(app.webview, "create_window") as create_window:
@@ -278,6 +288,42 @@ class PriceAppLifecycleTests(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["site"], "https://new.example")
         self.assertEqual(browser.load_urls, ["https://new.example"])
+
+    def test_refresh_login_webview_reloads_current_site(self):
+        api = self.new_api()
+        api.site = "https://current.example"
+        browser = FakeBrowserWindow()
+        api.attach_browser_window(browser)
+
+        with mock.patch.object(api, "_start_credential_helper") as credential_helper:
+            result = api.refresh_login_webview()
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(browser.load_urls, ["https://current.example"])
+        self.assertEqual(browser.show_count, 1)
+        self.assertFalse(api.browser_cancel_event.is_set())
+        credential_helper.assert_called_once_with("https://current.example")
+
+    def test_hide_login_webview_cancels_without_waiting_for_helper(self):
+        api = self.new_api()
+        api.site = "https://current.example"
+        browser = FakeBrowserWindow()
+        api.attach_browser_window(browser)
+        api.interactive_operation_lock.acquire()
+        try:
+            started = time.monotonic()
+            result = api.hide_login_webview()
+            self.assertLess(time.monotonic() - started, 0.2)
+        finally:
+            api.interactive_operation_lock.release()
+
+        self.assertTrue(result["ok"])
+        self.assertTrue(result["hidden"])
+        self.assertTrue(api.browser_cancel_event.is_set())
+        deadline = time.monotonic() + 1
+        while browser.hide_count == 0 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(browser.hide_count, 1)
 
     def test_interactive_capture_uses_a_daemon_job(self):
         api = self.new_api()

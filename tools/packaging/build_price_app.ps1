@@ -1,5 +1,5 @@
 param(
-  [string]$Version = "0.1.10"
+  [string]$Version = "0.1.11"
 )
 
 $ErrorActionPreference = "Stop"
@@ -67,10 +67,14 @@ if ($sourceVersion -ne $Version) {
 python -m pip install -r $requirements "pyinstaller==6.11.1" "pyinstaller-hooks-contrib<2025" -i https://pypi.org/simple --timeout 30
 if ($LASTEXITCODE -ne 0) { throw "pip install failed with exit code $LASTEXITCODE" }
 
-if (Test-Path $distRoot) { Remove-Item -LiteralPath $distRoot -Recurse -Force }
 if (Test-Path $buildRoot) { Remove-Item -LiteralPath $buildRoot -Recurse -Force }
 New-Item -ItemType Directory -Force $distRoot | Out-Null
 New-Item -ItemType Directory -Force $pyinstallerDistDir | Out-Null
+
+$releaseExe = Join-Path $distRoot "Sub2APIPriceMonitor-$Version.exe"
+if (Test-Path $releaseExe) {
+  Remove-Item -LiteralPath $releaseExe -Force
+}
 
 $versionParts = @($Version.Split('.') | ForEach-Object { [int]$_ })
 while ($versionParts.Count -lt 4) { $versionParts += 0 }
@@ -136,7 +140,6 @@ if (-not (Test-Path $builtExe)) {
 
 Assert-NoPrivateFiles $pyinstallerDistDir
 
-$releaseExe = Join-Path $distRoot "Sub2APIPriceMonitor-$Version.exe"
 Copy-Item -LiteralPath $builtExe -Destination $releaseExe -Force
 
 Assert-NoPrivateFiles $distRoot

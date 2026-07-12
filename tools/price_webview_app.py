@@ -71,7 +71,7 @@ OUTPUT_FIELDS = [
 
 
 APP_NAME = "Sub2APIPriceMonitor"
-APP_VERSION = "0.1.10"
+APP_VERSION = "0.1.11"
 APP_WINDOW_TITLE = "Sub2API 中转站比价"
 LOGGER = logging.getLogger(APP_NAME)
 SHUTDOWN_JOIN_TIMEOUT_SECONDS = 1.0
@@ -1352,6 +1352,8 @@ CONTROL_HTML = r"""<!doctype html>
       <button id="deleteSiteBtn" type="button">删除站点</button>
       <button id="clearCredentialsBtn" type="button">清除密码</button>
       <button id="openSiteBtn" type="button">WebView登录</button>
+      <button id="refreshLoginBtn" type="button">刷新登录页</button>
+      <button id="hideLoginBtn" type="button">收起登录窗口</button>
       <button id="captureBtn" type="button" class="primary">WebView抓取</button>
       <button id="updateAllBtn" type="button">更新全部</button>
       <button id="exportCsvBtn" type="button" disabled>导出 CSV</button>
@@ -1441,6 +1443,8 @@ CONTROL_HTML = r"""<!doctype html>
     const rememberCredentialsInput = document.querySelector('#rememberCredentialsInput');
     const autoLoginInput = document.querySelector('#autoLoginInput');
     const openSiteBtn = document.querySelector('#openSiteBtn');
+    const refreshLoginBtn = document.querySelector('#refreshLoginBtn');
+    const hideLoginBtn = document.querySelector('#hideLoginBtn');
     const captureBtn = document.querySelector('#captureBtn');
     const saveSiteBtn = document.querySelector('#saveSiteBtn');
     const deleteSiteBtn = document.querySelector('#deleteSiteBtn');
@@ -2021,6 +2025,48 @@ CONTROL_HTML = r"""<!doctype html>
       startLoginAutoCapture(reauthActiveSite === result.site ? 'reauth' : 'login');
     }
 
+    async function refreshLoginWebView() {
+      const mode = loginAutoCaptureMode || (reauthActiveSite ? 'reauth' : 'login');
+      stopLoginAutoCapture();
+      refreshLoginBtn.disabled = true;
+      setState('正在刷新登录页');
+      try {
+        const result = await window.pywebview.api.refresh_login_webview();
+        if (!result.ok) {
+          setState('刷新失败');
+          log(result.error);
+          return;
+        }
+        siteInput.value = result.site;
+        setState('WebView 登录中');
+        log(`已刷新 WebView 登录页：${result.site}`);
+        startLoginAutoCapture(mode);
+      } finally {
+        refreshLoginBtn.disabled = false;
+      }
+    }
+
+    async function hideLoginWebView() {
+      stopLoginAutoCapture();
+      hideLoginBtn.disabled = true;
+      try {
+        const result = await window.pywebview.api.hide_login_webview();
+        if (!result.ok) {
+          log(result.error);
+          return;
+        }
+        if (reauthActiveSite) {
+          log(`已暂缓重新授权：${reauthActiveSite}`);
+          reauthActiveSite = '';
+          setTimeout(startNextReauth, 500);
+        }
+        setState('登录窗口已收起');
+        log('已收起 WebView 登录窗口，可以继续更新或登录其他站点。');
+      } finally {
+        hideLoginBtn.disabled = false;
+      }
+    }
+
     async function capture(options = {}) {
       const auto = Boolean(options.auto);
       if (!auto) stopLoginAutoCapture();
@@ -2268,6 +2314,8 @@ CONTROL_HTML = r"""<!doctype html>
     deleteSiteBtn.addEventListener('click', deleteSite);
     clearCredentialsBtn.addEventListener('click', clearCredentials);
     openSiteBtn.addEventListener('click', openSite);
+    refreshLoginBtn.addEventListener('click', refreshLoginWebView);
+    hideLoginBtn.addEventListener('click', hideLoginWebView);
     captureBtn.addEventListener('click', capture);
     updateAllBtn.addEventListener('click', () => updateAllSaved('manual'));
     exportCsvBtn.addEventListener('click', () => exportRows('csv'));
@@ -2357,6 +2405,7 @@ class PriceAppApi:
             self.browser_cancel_event.set()
             threading.Thread(
                 target=self._hide_browser_window,
+                args=(self.browser_operation_id,),
                 name="hide-login-window",
                 daemon=True,
             ).start()
@@ -2582,7 +2631,9 @@ class PriceAppApi:
                 self.worker_windows[slot] = None
             raise
 
-    def _hide_browser_window(self):
+    def _hide_browser_window(self, operation_id=None):
+        if operation_id is not None and operation_id != self.browser_operation_id:
+            return
         if not self.browser_window:
             return
         try:
@@ -2791,6 +2842,38 @@ class PriceAppApi:
             }
         finally:
             self.interactive_operation_lock.release()
+
+    def refresh_login_webview(self):
+        if self.shutdown_event.is_set():
+            return {"ok": False, "shutting_down": True, "error": "应用正在退出"}
+        if not self.site:
+            return {"ok": False, "error": "请先选择并打开目标站点"}
+        self.browser_cancel_event.set()
+        if not self.interactive_operation_lock.acquire(timeout=INTERACTIVE_RELOGIN_WAIT_SECONDS):
+            return {"ok": False, "busy": True, "error": "登录窗口仍在执行操作，请稍后再试"}
+        try:
+            self._raise_if_shutting_down()
+            window = self._ensure_browser_window(self.site, visible=True)
+            self._start_credential_helper(self.site)
+            return {"ok": True, "site": self.site, "operation_id": self.browser_operation_id}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+        finally:
+            self.interactive_operation_lock.release()
+
+    def hide_login_webview(self):
+        if self.shutdown_event.is_set():
+            return {"ok": False, "shutting_down": True, "error": "应用正在退出"}
+        self.browser_cancel_event.set()
+        if not self._browser_alive():
+            return {"ok": True, "hidden": False, "site": self.site}
+        threading.Thread(
+            target=self._hide_browser_window,
+            args=(self.browser_operation_id,),
+            name="hide-login-window",
+            daemon=True,
+        ).start()
+        return {"ok": True, "hidden": True, "site": self.site}
 
     def start_capture_prices(self, api_base=API_BASE, include_groups=True, close_browser=True):
         if self.shutdown_event.is_set():
