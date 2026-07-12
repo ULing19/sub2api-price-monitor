@@ -9,6 +9,8 @@ output/
 price-sites.json
 price-latest.json
 price-latest.csv
+price-changes.json
+price-change-baselines.json
 price-history/
 price-webview-profile/
 chrome-profiles/

@@ -76,10 +76,11 @@ OUTPUT_FIELDS = [
 
 
 APP_NAME = "Sub2APIPriceMonitor"
-APP_VERSION = "1.0.0"
+APP_VERSION = "1.1.0"
 APP_WINDOW_TITLE = "Sub2API 中转站比价"
 LOGGER = logging.getLogger(APP_NAME)
 SHUTDOWN_JOIN_TIMEOUT_SECONDS = 1.0
+CHANGE_HISTORY_LIMIT = 500
 
 
 AUTH_ERROR_PATTERNS = (
@@ -547,6 +548,14 @@ def latest_prices_csv_path():
     return output_dir() / "price-latest.csv"
 
 
+def price_changes_path():
+    return output_dir() / "price-changes.json"
+
+
+def price_change_baselines_path():
+    return output_dir() / "price-change-baselines.json"
+
+
 def load_saved_sites():
     path = saved_sites_path()
     if not path.exists():
@@ -598,7 +607,7 @@ def normalize_saved_site_record(item):
     record = dict(item)
     site = str(record.get("site") or "")
     record["name"] = str(record.get("name") or site)
-    record["auto_refresh"] = True
+    record["auto_refresh"] = bool(record.get("auto_refresh", True))
     record["remember_credentials"] = bool(record.get("remember_credentials", True))
     record["auto_login"] = bool(record.get("auto_login", True)) and record["remember_credentials"]
     record["reauth_required"] = bool(
@@ -652,11 +661,412 @@ def load_latest_rows():
         return []
 
 
+def _stable_change_id(change):
+    payload = {
+        key: value
+        for key, value in change.items()
+        if key not in {"id", "acknowledged"}
+    }
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        default=str,
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()[:20]
+
+
+def load_price_changes(limit=CHANGE_HISTORY_LIMIT):
+    path = price_changes_path()
+    if not path.exists():
+        return []
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        changes = data.get("changes") if isinstance(data, dict) else data
+        if not isinstance(changes, list):
+            return []
+        normalized = []
+        for item in changes:
+            if not isinstance(item, dict):
+                continue
+            change = dict(item)
+            change["id"] = str(change.get("id") or _stable_change_id(change))
+            change["acknowledged"] = bool(change.get("acknowledged", False))
+            normalized.append(change)
+        return normalized[:max(1, int(limit or CHANGE_HISTORY_LIMIT))]
+    except Exception:
+        LOGGER.exception("Failed to load price changes from %s", path)
+        return []
+
+
+def write_price_changes(changes):
+    payload = {
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "changes": list(changes or [])[:CHANGE_HISTORY_LIMIT],
+    }
+    atomic_write_text(
+        price_changes_path(),
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+    )
+
+
+def load_price_change_baselines():
+    path = price_change_baselines_path()
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        sites = data.get("sites") if isinstance(data, dict) else None
+        if not isinstance(sites, dict):
+            return {}
+        normalized = {}
+        for site, rows in sites.items():
+            if not isinstance(rows, list):
+                continue
+            try:
+                site_key = normalize_site(site)
+            except ValueError:
+                site_key = str(site or "").strip()
+            if not site_key:
+                continue
+            normalized[site_key] = [dict(row) for row in rows if isinstance(row, dict)]
+        return normalized
+    except Exception:
+        LOGGER.exception("Failed to load price change baselines from %s", path)
+        return {}
+
+
+def write_price_change_baselines(baselines):
+    payload = {
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+        "sites": {
+            str(site): [dict(row) for row in rows if isinstance(row, dict)]
+            for site, rows in (baselines or {}).items()
+            if str(site or "").strip() and isinstance(rows, list)
+        },
+    }
+    atomic_write_text(
+        price_change_baselines_path(),
+        json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+    )
+
+
+def acknowledge_price_changes(change_ids=None):
+    selected = {str(item) for item in change_ids or [] if str(item)}
+    acknowledge_all = not selected
+    changes = load_price_changes()
+    changed = False
+    for item in changes:
+        if item.get("acknowledged"):
+            continue
+        if acknowledge_all or str(item.get("id") or "") in selected:
+            item["acknowledged"] = True
+            changed = True
+    if changed:
+        write_price_changes(changes)
+    return changes
+
+
+def _change_number(value):
+    if value is None or value == "":
+        return None
+    try:
+        number = float(str(value).replace(",", ""))
+    except (TypeError, ValueError):
+        return None
+    if number != number or number in (float("inf"), float("-inf")):
+        return None
+    return number
+
+
+def _change_value(value):
+    if isinstance(value, (bool, int, float)) or value is None:
+        return value
+    return str(value)
+
+
+def _change_row_value(row):
+    return {
+        "rate_multiplier": _change_value(row.get("rate_multiplier")),
+        "price": _change_value(row.get("price")),
+        "pay_price_cny": _change_value(row.get("pay_price_cny")),
+        "status": _change_value(row.get("status")),
+        "model_names": _change_value(row.get("model_names")),
+        "group_name": _change_value(row.get("group_name")),
+        "group_platform": _change_value(row.get("group_platform")),
+        "plan_name": _change_value(row.get("plan_name")),
+        "validity_days": _change_value(row.get("validity_days")),
+        "peak_rate_multiplier": _change_value(row.get("peak_rate_multiplier")),
+        "daily_limit_usd": _change_value(row.get("daily_limit_usd")),
+        "weekly_limit_usd": _change_value(row.get("weekly_limit_usd")),
+        "monthly_limit_usd": _change_value(row.get("monthly_limit_usd")),
+        "description": _change_value(row.get("description")),
+    }
+
+
+def _change_row_label(row):
+    category = str(row.get("model_category") or "其他")
+    name = (
+        row.get("group_name")
+        or row.get("group_id")
+        or row.get("plan_name")
+        or row.get("plan_id")
+        or row.get("model_names")
+        or "未命名项目"
+    )
+    return f"{category} · {name}"
+
+
+def _change_host(row):
+    return str(
+        row.get("site_host")
+        or urlparse(str(row.get("site") or "")).netloc
+        or row.get("site")
+        or ""
+    ).lower()
+
+
+def _change_site_key(row):
+    site = str(row.get("site") or "").strip() if isinstance(row, dict) else ""
+    if site:
+        try:
+            return normalize_site(site)
+        except ValueError:
+            return site
+    return _change_host(row) if isinstance(row, dict) else ""
+
+
+def _change_identity_key(row):
+    record_type = str(row.get("record_type") or "").strip().lower()
+    group_key = row.get("group_id") or row.get("group_name") or ""
+    plan_key = ""
+    if record_type == "plan":
+        plan_key = row.get("plan_id") or row.get("plan_name") or ""
+    return tuple(
+        str(value or "").strip().lower()
+        for value in (
+            _change_site_key(row),
+            record_type,
+            group_key,
+            plan_key,
+        )
+    )
+
+
+def _change_record(
+    change_type,
+    row,
+    detected_at,
+    old_value=None,
+    new_value=None,
+    message="",
+    change_percent=None,
+):
+    return {
+        "id": secrets.token_hex(10),
+        "change_type": change_type,
+        "site": row.get("site", "") if isinstance(row, dict) else "",
+        "site_key": _change_site_key(row) if isinstance(row, dict) else "",
+        "site_host": _change_host(row) if isinstance(row, dict) else "",
+        "record_type": row.get("record_type", "") if isinstance(row, dict) else "",
+        "model_category": row.get("model_category", "") if isinstance(row, dict) else "",
+        "item_label": _change_row_label(row) if isinstance(row, dict) else "",
+        "old_value": old_value,
+        "new_value": new_value,
+        "change_percent": change_percent,
+        "message": message,
+        "detected_at": detected_at,
+        "acknowledged": False,
+    }
+
+
+def detect_price_changes(previous_rows, current_rows):
+    previous_rows = [row for row in previous_rows or [] if isinstance(row, dict)]
+    current_rows = [row for row in current_rows or [] if isinstance(row, dict)]
+    if not previous_rows:
+        return []
+
+    previous_errors = {
+        _change_site_key(row): row
+        for row in previous_rows
+        if row.get("record_type") == "error"
+    }
+    current_errors = {
+        _change_site_key(row): row
+        for row in current_rows
+        if row.get("record_type") == "error"
+    }
+    changes = []
+    detected_at = datetime.now(timezone.utc).isoformat()
+
+    for site_key, row in sorted(current_errors.items()):
+        old_error = previous_errors.get(site_key)
+        host = _change_host(row)
+        error_text = str(row.get("error") or row.get("status_label") or "未获取到价格")
+        if not old_error or str(old_error.get("error") or "") != error_text:
+            changes.append(_change_record(
+                "site_error",
+                row,
+                detected_at,
+                old_value=(old_error or {}).get("error") if old_error else None,
+                new_value=error_text,
+                message=f"{host or '未知站点'} 抓取失败：{error_text}",
+            ))
+
+    def normal_rows(rows, error_hosts):
+        return {
+            _change_identity_key(row): row
+            for row in rows
+            if row.get("record_type") != "error" and _change_site_key(row) not in error_hosts
+        }
+
+    old_map = normal_rows(previous_rows, set(current_errors))
+    new_map = normal_rows(current_rows, set(current_errors))
+
+    for key in sorted(new_map.keys() - old_map.keys(), key=str):
+        row = new_map[key]
+        changes.append(_change_record(
+            "added",
+            row,
+            detected_at,
+            new_value=_change_row_value(row),
+            message=f"新增 {_change_row_label(row)}",
+        ))
+
+    for key in sorted(old_map.keys() - new_map.keys(), key=str):
+        row = old_map[key]
+        changes.append(_change_record(
+            "removed",
+            row,
+            detected_at,
+            old_value=_change_row_value(row),
+            message=f"移除 {_change_row_label(row)}",
+        ))
+
+    detail_fields = (
+        ("model_category", "模型分类"),
+        ("model_names", "模型"),
+        ("group_name", "分组名称"),
+        ("group_platform", "平台"),
+        ("plan_name", "套餐名称"),
+        ("description", "描述"),
+        ("status", "状态"),
+        ("validity_days", "有效期"),
+        ("peak_rate_multiplier", "高峰倍率"),
+        ("daily_limit_usd", "日限额"),
+        ("weekly_limit_usd", "周限额"),
+        ("monthly_limit_usd", "月限额"),
+    )
+    for key in sorted(old_map.keys() & new_map.keys(), key=str):
+        old_row = old_map[key]
+        new_row = new_map[key]
+        old_rate = _change_number(old_row.get("rate_multiplier"))
+        new_rate = _change_number(new_row.get("rate_multiplier"))
+        if old_rate != new_rate and (old_rate is not None or new_rate is not None):
+            percent = None
+            if old_rate not in (None, 0) and new_rate is not None:
+                percent = round((new_rate - old_rate) / old_rate * 100, 2)
+            changes.append(_change_record(
+                "rate_changed",
+                new_row,
+                detected_at,
+                old_value=old_rate,
+                new_value=new_rate,
+                change_percent=percent,
+                message=f"{_change_row_label(new_row)} 倍率 {old_rate} -> {new_rate}",
+            ))
+
+        old_price = _change_number(old_row.get("pay_price_cny"))
+        if old_price is None:
+            old_price = _change_number(old_row.get("price"))
+        new_price = _change_number(new_row.get("pay_price_cny"))
+        if new_price is None:
+            new_price = _change_number(new_row.get("price"))
+        if old_price != new_price and (old_price is not None or new_price is not None):
+            percent = None
+            if old_price not in (None, 0) and new_price is not None:
+                percent = round((new_price - old_price) / old_price * 100, 2)
+            changes.append(_change_record(
+                "price_changed",
+                new_row,
+                detected_at,
+                old_value=old_price,
+                new_value=new_price,
+                change_percent=percent,
+                message=f"{_change_row_label(new_row)} 价格 {old_price} -> {new_price}",
+            ))
+
+        changed_fields = [
+            label
+            for field, label in detail_fields
+            if _change_value(old_row.get(field)) != _change_value(new_row.get(field))
+        ]
+        if changed_fields:
+            changes.append(_change_record(
+                "details_changed",
+                new_row,
+                detected_at,
+                old_value=_change_row_value(old_row),
+                new_value=_change_row_value(new_row),
+                message=f"{_change_row_label(new_row)} 变更：{'、'.join(changed_fields)}",
+            ))
+
+    return changes[:CHANGE_HISTORY_LIMIT]
+
+
+def remove_price_changes_for_site(site):
+    site_key = normalize_site(site)
+    changes = [
+        item for item in load_price_changes()
+        if _change_site_key(item) != site_key
+    ]
+    write_price_changes(changes)
+    baselines = load_price_change_baselines()
+    if site_key in baselines:
+        baselines.pop(site_key, None)
+        write_price_change_baselines(baselines)
+    return changes
+
+
 def write_price_snapshot(rows, summary):
+    previous_rows = load_latest_rows()
+    baselines = load_price_change_baselines()
+
+    def rows_by_site(source_rows):
+        grouped = {}
+        for row in source_rows or []:
+            if not isinstance(row, dict):
+                continue
+            site_key = _change_site_key(row)
+            if site_key:
+                grouped.setdefault(site_key, []).append(row)
+        return grouped
+
+    previous_by_site = rows_by_site(previous_rows)
+    current_by_site = rows_by_site(rows)
+    comparison_rows = []
+    for site_key, site_rows in current_by_site.items():
+        successful_rows = [
+            row for row in site_rows
+            if row.get("record_type") != "error"
+        ]
+        if successful_rows:
+            baseline_rows = baselines.get(site_key)
+            comparison_rows.extend(baseline_rows if baseline_rows is not None else successful_rows)
+            baselines[site_key] = [dict(row) for row in successful_rows]
+        else:
+            comparison_rows.extend(previous_by_site.get(site_key, []))
+
+    changes = detect_price_changes(comparison_rows, rows)
+    if changes:
+        write_price_changes(changes + load_price_changes())
+    write_price_change_baselines(baselines)
     generated_at = datetime.now(timezone.utc).isoformat()
     payload = {
         "generated_at": generated_at,
         "summary": summary,
+        "changes": changes,
         "rows": rows,
     }
     json_content = json.dumps(payload, ensure_ascii=False, indent=2) + "\n"
@@ -1231,6 +1641,18 @@ CONTROL_HTML = r"""<!doctype html>
     }
     .nav-item.active { border-color: #fed7aa; background: var(--accent-soft); color: #c2410c; }
     .nav-icon { width: 22px; color: currentColor; text-align: center; font-weight: 800; }
+    .nav-count {
+      min-width: 20px;
+      height: 20px;
+      margin-left: auto;
+      padding: 0 6px;
+      border-radius: 10px;
+      background: #dc2626;
+      color: #fff;
+      font-size: 11px;
+      line-height: 20px;
+      text-align: center;
+    }
     .site-picker { display: grid; gap: 8px; }
     .site-count { color: var(--muted); font-size: 11px; }
     .side-spacer { flex: 1; }
@@ -1322,6 +1744,42 @@ CONTROL_HTML = r"""<!doctype html>
     .toggle-list { display: grid; gap: 8px; margin-bottom: 14px; }
     .action-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
     .action-grid .wide { grid-column: 1 / -1; }
+    .changes-view {
+      display: grid;
+      grid-template-rows: auto auto minmax(260px, 1fr) auto;
+      gap: 12px;
+      padding: 18px;
+      overflow: hidden;
+    }
+    .changes-view .section-head { margin-bottom: 0; }
+    .changes-toolbar {
+      display: grid;
+      grid-template-columns: minmax(190px, 1.5fr) minmax(150px, 1fr) minmax(135px, 0.8fr) auto;
+      gap: 9px;
+      align-items: end;
+      padding: 10px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--panel);
+    }
+    .changes-table-wrap { min-height: 260px; overflow: auto; border: 1px solid var(--border); border-radius: 8px; background: var(--panel); }
+    .changes-table { min-width: 1060px; }
+    .change-unread td { background: #fffaf5; }
+    .change-kind {
+      display: inline-block;
+      min-width: 68px;
+      padding: 3px 7px;
+      border-radius: 6px;
+      background: #eef2ff;
+      color: #3730a3;
+      font-weight: 750;
+      text-align: center;
+    }
+    .change-kind.rate_changed, .change-kind.price_changed { background: #fff7ed; color: #c2410c; }
+    .change-kind.added { background: #ecfdf5; color: #047857; }
+    .change-kind.removed, .change-kind.site_error { background: #fef2f2; color: #b91c1c; }
+    .change-value { max-width: 190px; color: #4b5563; overflow-wrap: anywhere; }
+    .changes-footer { display: flex; justify-content: flex-end; color: var(--muted); font-size: 12px; }
     .logs-view { padding: 18px; }
     .console { height: 100%; min-height: 0; border: 1px solid #202833; border-radius: 8px; overflow: hidden; background: #0d1117; }
     .console-head { display: flex; align-items: center; justify-content: space-between; height: 40px; padding: 0 12px; border-bottom: 1px solid #252d38; background: #151b23; color: #e5e7eb; font-size: 12px; font-weight: 750; }
@@ -1338,6 +1796,63 @@ CONTROL_HTML = r"""<!doctype html>
       .summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .price-view { grid-template-rows: auto auto auto 360px auto; overflow: auto; }
       .settings-layout { grid-template-columns: 1fr; }
+      .changes-view { overflow: auto; grid-template-rows: auto auto 420px auto; }
+      .changes-toolbar { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
+    @media (max-width: 640px) {
+      body { overflow: auto; }
+      .app-shell {
+        height: auto;
+        min-height: 100vh;
+        grid-template-columns: minmax(0, 1fr);
+        grid-template-rows: auto minmax(0, 1fr);
+      }
+      .sidebar {
+        display: grid;
+        gap: 10px;
+        padding: 10px;
+        border-right: 0;
+        border-bottom: 1px solid var(--border);
+      }
+      .brand { padding: 0; }
+      .brand-mark { width: 34px; height: 34px; }
+      .brand-copy strong { font-size: 14px; }
+      .side-label, .side-spacer, .side-status { display: none; }
+      .side-nav { grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 4px; }
+      .nav-item {
+        justify-content: center;
+        gap: 4px;
+        height: 36px;
+        padding: 0 5px;
+        font-size: 11px;
+        text-align: center;
+      }
+      .nav-icon { display: none; }
+      .nav-count { margin-left: 0; min-width: 18px; height: 18px; line-height: 18px; padding: 0 5px; }
+      .site-picker { grid-template-columns: minmax(0, 1fr) auto; align-items: center; }
+      .site-count { white-space: nowrap; }
+      .workspace { min-height: 0; grid-template-rows: auto minmax(0, 1fr); }
+      .topbar {
+        grid-template-columns: minmax(0, 1fr);
+        grid-template-rows: auto auto auto;
+        gap: 8px;
+        padding: 10px;
+      }
+      .page-heading { grid-column: 1; grid-row: 1; }
+      .top-actions { grid-column: 1; grid-row: 2; justify-content: flex-start; overflow-x: auto; }
+      .tabs {
+        grid-column: 1;
+        grid-row: 3;
+        grid-template-columns: repeat(5, 86px);
+        overflow-x: auto;
+      }
+      .view-host { overflow: auto; }
+      .price-view, .site-view, .changes-view, .logs-view { padding: 10px; }
+      .summary, .category-strip, .filter-bar, .settings-grid, .changes-toolbar { grid-template-columns: minmax(0, 1fr); }
+      .field-wide { grid-column: auto; }
+      .section-head { flex-direction: column; align-items: flex-start; }
+      .changes-view { grid-template-rows: auto auto minmax(360px, 1fr) auto; overflow: visible; }
+      .changes-table-wrap, .table-wrap { max-width: 100%; }
     }
   </style>
 </head>
@@ -1357,6 +1872,7 @@ CONTROL_HTML = r"""<!doctype html>
         <nav class="side-nav" aria-label="工作区导航">
           <button class="nav-item active" type="button" data-view="prices"><span class="nav-icon">¥</span>当前价格</button>
           <button class="nav-item" type="button" data-view="sites"><span class="nav-icon">S</span>站点与授权</button>
+          <button class="nav-item" type="button" data-view="changes"><span class="nav-icon">Δ</span>价格变化<span class="nav-count" id="changeCountBadge" hidden>0</span></button>
           <button class="nav-item" type="button" data-view="logs"><span class="nav-icon">›_</span>运行日志</button>
         </nav>
       </div>
@@ -1491,6 +2007,7 @@ CONTROL_HTML = r"""<!doctype html>
             <section class="tool-panel">
               <h3>授权与操作</h3>
               <div class="toggle-list">
+                <label class="toggle"><input id="autoRefreshInput" type="checkbox" checked />自动检查此站点</label>
                 <label class="toggle"><input id="includeGroupsInput" type="checkbox" checked />包含分组倍率</label>
                 <label class="toggle"><input id="rememberCredentialsInput" type="checkbox" checked />保存密码到 Windows 凭据管理器</label>
                 <label class="toggle"><input id="autoLoginInput" type="checkbox" checked />允许自动填写与登录</label>
@@ -1506,6 +2023,64 @@ CONTROL_HTML = r"""<!doctype html>
               </div>
             </section>
           </div>
+        </section>
+
+        <section class="view changes-view" id="changesView" hidden>
+          <div class="section-head">
+            <div>
+              <h2>价格变化</h2>
+              <p>独立记录倍率、价格、分组和抓取状态变化，不会混入当前价格快照。</p>
+            </div>
+            <button id="acknowledgeChangesBtn" type="button">全部标记已读</button>
+          </div>
+
+          <div class="changes-toolbar">
+            <label>
+              搜索
+              <input id="changeSearchInput" type="search" spellcheck="false" placeholder="站点、项目、变化内容" />
+            </label>
+            <label>
+              站点
+              <select id="changeSiteFilterSelect"></select>
+            </label>
+            <label>
+              变化类型
+              <select id="changeTypeFilterSelect">
+                <option value="">全部</option>
+                <option value="rate_changed">倍率变化</option>
+                <option value="price_changed">价格变化</option>
+                <option value="added">新增项目</option>
+                <option value="removed">移除项目</option>
+                <option value="details_changed">信息变化</option>
+                <option value="site_error">抓取失败</option>
+              </select>
+            </label>
+            <label class="toggle">
+              <input id="unreadOnlyInput" type="checkbox" />
+              只看未读
+            </label>
+          </div>
+
+          <div class="changes-table-wrap">
+            <table class="changes-table">
+              <thead>
+                <tr>
+                  <th>状态</th>
+                  <th>类型</th>
+                  <th>站点</th>
+                  <th>项目</th>
+                  <th>旧值</th>
+                  <th>新值</th>
+                  <th>变化</th>
+                  <th>时间</th>
+                </tr>
+              </thead>
+              <tbody id="changesBody">
+                <tr><td colspan="8" class="empty">暂无变化记录</td></tr>
+              </tbody>
+            </table>
+          </div>
+          <div class="changes-footer"><span id="changesCountLabel">0 条变化</span></div>
         </section>
 
         <section class="view logs-view" id="logsView" hidden>
@@ -1527,6 +2102,7 @@ CONTROL_HTML = r"""<!doctype html>
     const siteNameInput = document.querySelector('#siteNameInput');
     const intervalHoursInput = document.querySelector('#intervalHoursInput');
     const apiBaseInput = document.querySelector('#apiBaseInput');
+    const autoRefreshInput = document.querySelector('#autoRefreshInput');
     const includeGroupsInput = document.querySelector('#includeGroupsInput');
     const rememberCredentialsInput = document.querySelector('#rememberCredentialsInput');
     const autoLoginInput = document.querySelector('#autoLoginInput');
@@ -1563,12 +2139,22 @@ CONTROL_HTML = r"""<!doctype html>
     const viewTitle = document.querySelector('#viewTitle');
     const snapshotTime = document.querySelector('#snapshotTime');
     const siteCountLabel = document.querySelector('#siteCountLabel');
+    const changeCountBadge = document.querySelector('#changeCountBadge');
+    const changesBody = document.querySelector('#changesBody');
+    const changesCountLabel = document.querySelector('#changesCountLabel');
+    const changeSearchInput = document.querySelector('#changeSearchInput');
+    const changeSiteFilterSelect = document.querySelector('#changeSiteFilterSelect');
+    const changeTypeFilterSelect = document.querySelector('#changeTypeFilterSelect');
+    const unreadOnlyInput = document.querySelector('#unreadOnlyInput');
+    const acknowledgeChangesBtn = document.querySelector('#acknowledgeChangesBtn');
     const pricesView = document.querySelector('#pricesView');
     const sitesView = document.querySelector('#sitesView');
+    const changesView = document.querySelector('#changesView');
     const logsView = document.querySelector('#logsView');
     const navItems = [...document.querySelectorAll('.nav-item[data-view]')];
     let rows = [];
     let savedSites = [];
+    let changes = [];
     let latestGeneratedAt = '';
     let stateRevision = 0;
     let activeCategory = '';
@@ -1633,8 +2219,8 @@ CONTROL_HTML = r"""<!doctype html>
     }
 
     function setView(view) {
-      const views = { prices: pricesView, sites: sitesView, logs: logsView };
-      const titles = { prices: '当前价格', sites: '站点与授权', logs: '运行日志' };
+      const views = { prices: pricesView, sites: sitesView, changes: changesView, logs: logsView };
+      const titles = { prices: '当前价格', sites: '站点与授权', changes: '价格变化', logs: '运行日志' };
       activeView = views[view] ? view : 'prices';
       for (const [name, element] of Object.entries(views)) {
         element.hidden = name !== activeView;
@@ -1644,6 +2230,7 @@ CONTROL_HTML = r"""<!doctype html>
       }
       viewTitle.textContent = titles[activeView];
       if (activeView === 'prices') render();
+      if (activeView === 'changes') renderChanges();
     }
 
     function categoryRank(category) {
@@ -1862,8 +2449,9 @@ CONTROL_HTML = r"""<!doctype html>
         const statusText = site.last_status_label || statusLabels[site.last_status] || site.last_status;
         const status = statusText ? ` · ${statusText}` : '';
         const credential = site.credentials_saved ? ' · 已保存密码' : '';
+        const disabled = site.auto_refresh === false ? ' · 已停用自动检查' : '';
         const name = site.name && site.name !== site.site ? `${site.name} · ${site.site}` : site.site;
-        const label = `${name}${interval}${next}${status}${credential}`;
+        const label = `${name}${interval}${next}${status}${credential}${disabled}`;
         return `<option value="${escapeHtml(site.site)}">${escapeHtml(label)}</option>`;
       }).join('');
       if (savedSites.some((site) => site.site === selected)) savedSiteSelect.value = selected;
@@ -1932,6 +2520,114 @@ CONTROL_HTML = r"""<!doctype html>
       resultBody.innerHTML = htmlRows.join('');
     }
 
+    function changeTypeLabel(type) {
+      return ({
+        rate_changed: '倍率变化',
+        price_changed: '价格变化',
+        added: '新增项目',
+        removed: '移除项目',
+        details_changed: '信息变化',
+        site_error: '抓取失败',
+      })[type] || type || '变化';
+    }
+
+    function compactChangeValue(value) {
+      if (value === null || value === undefined || value === '') return '—';
+      if (typeof value !== 'object') return String(value);
+      const parts = [
+        ['倍率', value.rate_multiplier],
+        ['CNY', value.pay_price_cny],
+        ['价格', value.price],
+        ['状态', value.status],
+        ['分组', value.group_name],
+        ['平台', value.group_platform],
+        ['套餐', value.plan_name],
+        ['有效期', value.validity_days],
+        ['高峰倍率', value.peak_rate_multiplier],
+        ['日限额', value.daily_limit_usd],
+        ['周限额', value.weekly_limit_usd],
+        ['月限额', value.monthly_limit_usd],
+        ['描述', value.description],
+      ].filter(([, item]) => item !== null && item !== undefined && item !== '');
+      if (parts.length) return parts.map(([label, item]) => `${label} ${item}`).join(' · ');
+      try { return JSON.stringify(value); } catch { return String(value); }
+    }
+
+    function renderChangeBadge() {
+      const unread = changes.filter((item) => !item.acknowledged).length;
+      changeCountBadge.textContent = unread > 99 ? '99+' : String(unread);
+      changeCountBadge.hidden = unread === 0;
+      acknowledgeChangesBtn.disabled = unread === 0;
+    }
+
+    function renderChangeSiteOptions() {
+      const selected = changeSiteFilterSelect.value;
+      const sites = [...new Set(changes.map((item) => item.site_host || item.site).filter(Boolean))]
+        .sort((a, b) => a.localeCompare(b, 'zh-CN'));
+      changeSiteFilterSelect.innerHTML = '<option value="">全部站点</option>' + sites.map((site) => (
+        `<option value="${escapeHtml(site)}">${escapeHtml(site)}</option>`
+      )).join('');
+      if (sites.includes(selected)) changeSiteFilterSelect.value = selected;
+    }
+
+    function getFilteredChanges() {
+      const query = changeSearchInput.value.trim().toLowerCase();
+      const site = changeSiteFilterSelect.value;
+      const type = changeTypeFilterSelect.value;
+      return changes.filter((item) => {
+        if (site && (item.site_host || item.site) !== site) return false;
+        if (type && item.change_type !== type) return false;
+        if (unreadOnlyInput.checked && item.acknowledged) return false;
+        if (query) {
+          const text = [
+            item.site,
+            item.site_host,
+            item.item_label,
+            item.message,
+            item.change_type,
+            compactChangeValue(item.old_value),
+            compactChangeValue(item.new_value),
+          ].join(' ').toLowerCase();
+          if (!text.includes(query)) return false;
+        }
+        return true;
+      }).sort((a, b) => String(b.detected_at || '').localeCompare(String(a.detected_at || '')));
+    }
+
+    function renderChanges() {
+      renderChangeBadge();
+      renderChangeSiteOptions();
+      const displayChanges = getFilteredChanges();
+      changesCountLabel.textContent = `${displayChanges.length}/${changes.length} 条变化`;
+      if (!changes.length) {
+        changesBody.innerHTML = '<tr><td colspan="8" class="empty">暂无变化记录</td></tr>';
+        return;
+      }
+      if (!displayChanges.length) {
+        changesBody.innerHTML = '<tr><td colspan="8" class="empty">没有符合筛选条件的变化</td></tr>';
+        return;
+      }
+      changesBody.innerHTML = displayChanges.map((item) => {
+        const unreadClass = item.acknowledged ? '' : ' class="change-unread"';
+        const hasPercent = item.change_percent !== null
+          && item.change_percent !== undefined
+          && item.change_percent !== '';
+        const percent = hasPercent && Number.isFinite(Number(item.change_percent))
+          ? `${Number(item.change_percent) > 0 ? '+' : ''}${item.change_percent}%`
+          : '—';
+        return `<tr${unreadClass}>
+          <td>${item.acknowledged ? '已读' : '未读'}</td>
+          <td><span class="change-kind ${escapeHtml(item.change_type)}">${escapeHtml(changeTypeLabel(item.change_type))}</span></td>
+          <td>${escapeHtml(item.site_host || item.site)}</td>
+          <td>${escapeHtml(item.item_label)}<small>${escapeHtml(item.message)}</small></td>
+          <td class="change-value">${escapeHtml(compactChangeValue(item.old_value))}</td>
+          <td class="change-value">${escapeHtml(compactChangeValue(item.new_value))}</td>
+          <td>${escapeHtml(percent)}</td>
+          <td>${escapeHtml(formatDateTime(item.detected_at))}</td>
+        </tr>`;
+      }).join('');
+    }
+
     function applySavedSite(site) {
       if (!site) return;
       siteInput.value = site.site || '';
@@ -1940,6 +2636,7 @@ CONTROL_HTML = r"""<!doctype html>
       noteTouched = false;
       apiBaseInput.value = site.api_base || '/api/v1';
       intervalHoursInput.value = site.interval_minutes ? String(Math.round(site.interval_minutes / 60 * 100) / 100) : '3';
+      autoRefreshInput.checked = site.auto_refresh !== false;
       rememberCredentialsInput.checked = site.remember_credentials !== false;
       autoLoginInput.checked = site.auto_login !== false && rememberCredentialsInput.checked;
     }
@@ -1961,13 +2658,15 @@ CONTROL_HTML = r"""<!doctype html>
         apiBaseInput.value,
         intervalHoursInput.value,
         rememberCredentialsInput.checked,
-        autoLoginInput.checked
+        autoLoginInput.checked,
+        autoRefreshInput.checked
       );
       if (!result.ok) {
         log(result.error);
         return;
       }
       savedSites = result.saved_sites || [];
+      if (Array.isArray(result.changes)) changes = result.changes;
       stateRevision = Number(result.revision) || stateRevision;
       renderSavedSites();
       savedSiteSelect.value = result.site;
@@ -1991,6 +2690,7 @@ CONTROL_HTML = r"""<!doctype html>
         setTimeout(startNextReauth, 0);
       }
       renderSavedSites();
+      renderChanges();
       log(result.credentials_deleted
         ? `已删除站点及其保存密码：${result.site}`
         : `已删除站点：${result.site}`);
@@ -2262,10 +2962,12 @@ CONTROL_HTML = r"""<!doctype html>
         }
         rows = result.rows || [];
         savedSites = result.saved_sites || savedSites;
+        if (Array.isArray(result.changes)) changes = result.changes;
         latestGeneratedAt = result.generated_at || latestGeneratedAt;
         stateRevision = Number(result.revision) || stateRevision;
         currentPage = 0;
         renderSavedSites();
+        renderChangeBadge();
         setView('prices');
         const errorOnly = rows.length > 0 && rows.every((row) => row.record_type === 'error');
         setState(errorOnly ? '未获取到价格' : '抓取完成');
@@ -2317,6 +3019,9 @@ CONTROL_HTML = r"""<!doctype html>
         render();
         snapshotTime.textContent = '正在重建当前价格快照';
         setState('后台更新中');
+      } else {
+        setState(reason === 'startup' ? '自动检查待命' : '无需更新');
+        log(result.message || '没有需要更新的站点');
       }
       scheduleStatusPoll(250);
     }
@@ -2341,6 +3046,11 @@ CONTROL_HTML = r"""<!doctype html>
     function applyRuntimeStatus(result) {
       savedSites = result.saved_sites || savedSites;
       renderSavedSites();
+      if (Array.isArray(result.changes)) {
+        changes = result.changes;
+        renderChangeBadge();
+        if (activeView === 'changes') renderChanges();
+      }
       if (result.rows_changed) {
         stateRevision = Number(result.revision) || stateRevision;
         latestGeneratedAt = result.latest_generated_at || latestGeneratedAt;
@@ -2409,9 +3119,11 @@ CONTROL_HTML = r"""<!doctype html>
       siteInput.value = state.site;
       savedSites = state.saved_sites || [];
       rows = state.latest_rows || [];
+      changes = state.changes || [];
       latestGeneratedAt = state.latest_generated_at || '';
       stateRevision = Number(state.revision) || 0;
       renderSavedSites();
+      renderChangeBadge();
       setView('prices');
       const currentSite = savedSites.find((item) => item.site === state.site);
       if (currentSite) {
@@ -2430,6 +3142,25 @@ CONTROL_HTML = r"""<!doctype html>
         await updateAllSaved('startup');
       }
       scheduleStatusPoll(500);
+    }
+
+    async function acknowledgeAllChanges() {
+      const unread = changes.filter((item) => !item.acknowledged).length;
+      if (!unread) return;
+      acknowledgeChangesBtn.disabled = true;
+      try {
+        const result = await window.pywebview.api.acknowledge_changes();
+        if (!result.ok) {
+          log(result.error);
+          return;
+        }
+        changes = result.changes || [];
+        stateRevision = Number(result.revision) || stateRevision;
+        renderChanges();
+        log(`已将 ${unread} 条价格变化标记为已读`);
+      } finally {
+        renderChangeBadge();
+      }
     }
 
     siteInput.addEventListener('input', () => {
@@ -2451,6 +3182,11 @@ CONTROL_HTML = r"""<!doctype html>
     typeFilterSelect.addEventListener('change', () => { currentPage = 0; render(); });
     maxRateInput.addEventListener('input', () => scheduleRender(true));
     priceOnlyInput.addEventListener('change', () => { currentPage = 0; render(); });
+    changeSearchInput.addEventListener('input', renderChanges);
+    changeSiteFilterSelect.addEventListener('change', renderChanges);
+    changeTypeFilterSelect.addEventListener('change', renderChanges);
+    unreadOnlyInput.addEventListener('change', renderChanges);
+    acknowledgeChangesBtn.addEventListener('click', acknowledgeAllChanges);
     prevPageBtn.addEventListener('click', () => {
       if (currentPage > 0) {
         currentPage -= 1;
@@ -3287,12 +4023,17 @@ class PriceAppApi:
         with self.job_lock:
             update = dict(self.update_job)
             update["summary"] = dict(update.get("summary") or {})
+        changes = load_price_changes()
         return {
             "revision": revision,
             "rows_changed": known != revision,
             "rows": rows,
             "saved_sites": saved_sites,
             "latest_generated_at": generated_at,
+            "changes": changes,
+            "unacknowledged_change_count": sum(
+                1 for item in changes if not item.get("acknowledged")
+            ),
             "update": update,
         }
 
@@ -3304,9 +4045,27 @@ class PriceAppApi:
             "reauth_sites": self._reauth_sites(snapshot["saved_sites"]),
             "latest_rows": snapshot["rows"],
             "latest_generated_at": snapshot["latest_generated_at"],
+            "changes": snapshot["changes"],
+            "unacknowledged_change_count": snapshot["unacknowledged_change_count"],
             "revision": snapshot["revision"],
             "update": snapshot["update"],
         }
+
+    def acknowledge_changes(self, change_ids=None):
+        try:
+            with self.data_lock:
+                changes = acknowledge_price_changes(change_ids)
+                revision = self._cache_state()
+            return {
+                "ok": True,
+                "changes": changes,
+                "unacknowledged_change_count": sum(
+                    1 for item in changes if not item.get("acknowledged")
+                ),
+                "revision": revision,
+            }
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
 
     def save_site(
         self,
@@ -3331,6 +4090,7 @@ class PriceAppApi:
                     interval_hours,
                     remember_credentials,
                     auto_login,
+                    auto_refresh,
                 )
                 annotated = annotate_saved_sites(saved)
                 revision = self._cache_state(saved_sites=annotated)
@@ -3350,6 +4110,7 @@ class PriceAppApi:
                 credentials_deleted = delete_site_credentials(normalized)
                 saved = [item for item in load_saved_sites() if item.get("site") != normalized]
                 write_saved_sites(saved)
+                changes = remove_price_changes_for_site(normalized)
                 self.auto_login_attempts.pop(normalized, None)
                 annotated = annotate_saved_sites(saved)
                 revision = self._cache_state(saved_sites=annotated)
@@ -3358,6 +4119,10 @@ class PriceAppApi:
                 "site": normalized,
                 "credentials_deleted": credentials_deleted,
                 "saved_sites": annotated,
+                "changes": changes,
+                "unacknowledged_change_count": sum(
+                    1 for item in changes if not item.get("acknowledged")
+                ),
                 "revision": revision,
             }
         except Exception as exc:
@@ -3586,6 +4351,7 @@ class PriceAppApi:
                     saved_sites = self._update_site_status(record, {"ok": True, "rows": fresh_rows})
                 else:
                     saved_sites = [dict(item) for item in self.cached_saved_sites]
+                changes = load_price_changes()
                 revision = self._cache_state(
                     rows=merged_rows,
                     saved_sites=saved_sites,
@@ -3600,6 +4366,7 @@ class PriceAppApi:
                 "generated_at": snapshot["generated_at"],
                 "rows": merged_rows,
                 "saved_sites": saved_sites,
+                "changes": changes,
                 "revision": revision,
             }
         except Exception as exc:
@@ -3641,16 +4408,21 @@ class PriceAppApi:
                     sites = load_saved_sites()
                 if not sites:
                     raise RuntimeError("还没有保存站点")
+                reason_name = str(reason or "manual").strip().lower()
+                enabled_only = reason_name in {"startup", "scheduler"}
                 due_sites = [
                     item for item in sites
-                    if item.get("site") and (not only_due or self._is_site_due(item))
+                    if item.get("site")
+                    and (not enabled_only or item.get("auto_refresh", True))
+                    and (not only_due or self._is_site_due(item))
                 ]
-                if only_due and not due_sites:
+                if not due_sites:
                     return {
                         "ok": True,
                         "accepted": False,
                         "busy": False,
                         "due": False,
+                        "message": "没有需要自动检查的站点",
                         "update": dict(self.update_job),
                     }
                 self.update_job_sequence += 1
@@ -3670,7 +4442,7 @@ class PriceAppApi:
                 }
                 self.update_thread = threading.Thread(
                     target=self._run_update_job,
-                    args=(job_id, sites, bool(only_due)),
+                    args=(job_id, sites, bool(only_due), enabled_only),
                     name=f"price-update-{job_id}",
                     daemon=True,
                 )
@@ -3684,13 +4456,14 @@ class PriceAppApi:
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
 
-    def _run_update_job(self, job_id, sites, only_due):
+    def _run_update_job(self, job_id, sites, only_due, enabled_only):
         try:
             with self.update_lock:
                 self._raise_if_shutting_down()
                 result = self._run_site_records(
                     sites,
                     only_due=only_due,
+                    enabled_only=enabled_only,
                     progress_callback=lambda completed, total, site: self._update_job_progress(
                         job_id, completed, total, site
                     ),
@@ -3847,11 +4620,13 @@ class PriceAppApi:
             for thread in threads:
                 thread.join(0.5)
 
-    def _run_site_records(self, sites, only_due, progress_callback=None):
+    def _run_site_records(self, sites, only_due, progress_callback=None, enabled_only=False):
         self._raise_if_shutting_down()
         due_sites = []
         for record in sites:
             if not record.get("site"):
+                continue
+            if enabled_only and not record.get("auto_refresh", True):
                 continue
             if only_due and not self._is_site_due(record):
                 continue
@@ -4183,7 +4958,7 @@ class PriceAppApi:
         updated["name"] = str(updated.get("name") or updated["site"])
         updated["api_base"] = self._normalized_api_base(updated.get("api_base", API_BASE))
         updated["browser_mode"] = "webview"
-        updated["auto_refresh"] = True
+        updated["auto_refresh"] = bool(record.get("auto_refresh", True))
         updated["last_run"] = now
         auth_required = bool(result.get("auth_required"))
         error_code = result.get("error_code") or ("reauth_required" if auth_required else "")
@@ -4470,7 +5245,7 @@ class PriceAppApi:
             "api_base": normalized_base,
             "browser_mode": "webview",
             "interval_minutes": interval,
-            "auto_refresh": True,
+            "auto_refresh": bool(auto_refresh),
             "remember_credentials": bool(remember_credentials),
             "auto_login": bool(auto_login) and bool(remember_credentials),
             "created_at": previous.get("created_at") or now,

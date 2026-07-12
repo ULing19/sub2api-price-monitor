@@ -1,5 +1,5 @@
 param(
-  [string]$Version = "1.0.0"
+  [string]$Version = "1.1.0"
 )
 
 $ErrorActionPreference = "Stop"
@@ -19,6 +19,8 @@ $privateNames = @(
   "price-sites.json",
   "price-latest.json",
   "price-latest.csv",
+  "price-changes.json",
+  "price-change-baselines.json",
   "price-history",
   "price-webview-profile",
   "logs",

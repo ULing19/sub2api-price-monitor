@@ -450,6 +450,286 @@ class PriceAppLifecycleTests(unittest.TestCase):
         self.assertEqual(rows[0]["record_type"], "error")
         self.assertEqual(rows[0]["error"], "current failure")
 
+    def test_detect_price_changes_covers_price_rate_details_add_and_remove(self):
+        previous = [
+            {
+                "site": "https://a.example",
+                "site_host": "a.example",
+                "record_type": "group",
+                "model_category": "OpenAI",
+                "group_id": "rate",
+                "group_name": "rate",
+                "rate_multiplier": 1,
+            },
+            {
+                "site": "https://a.example",
+                "site_host": "a.example",
+                "record_type": "plan",
+                "model_category": "OpenAI",
+                "plan_id": "price",
+                "plan_name": "price",
+                "price": 10,
+            },
+            {
+                "site": "https://a.example",
+                "site_host": "a.example",
+                "record_type": "group",
+                "model_category": "OpenAI",
+                "group_id": "details",
+                "group_name": "details",
+                "description": "old description",
+                "validity_days": 30,
+            },
+            {
+                "site": "https://a.example",
+                "site_host": "a.example",
+                "record_type": "group",
+                "model_category": "OpenAI",
+                "group_id": "removed",
+                "group_name": "removed",
+            },
+        ]
+        current = [
+            {
+                **previous[0],
+                "rate_multiplier": 1.25,
+            },
+            {
+                **previous[1],
+                "price": 8,
+            },
+            {
+                **previous[2],
+                "description": "new description",
+                "validity_days": 60,
+            },
+            {
+                "site": "https://a.example",
+                "site_host": "a.example",
+                "record_type": "group",
+                "model_category": "OpenAI",
+                "group_id": "added",
+                "group_name": "added",
+            },
+        ]
+
+        changes = app.detect_price_changes(previous, current)
+        by_type = {change["change_type"]: change for change in changes}
+
+        self.assertTrue({
+            "rate_changed",
+            "price_changed",
+            "details_changed",
+            "added",
+            "removed",
+        }.issubset(by_type))
+        self.assertEqual(by_type["rate_changed"]["change_percent"], 25.0)
+        self.assertEqual(by_type["price_changed"]["change_percent"], -20.0)
+        self.assertEqual(
+            by_type["details_changed"]["old_value"]["description"],
+            "old description",
+        )
+        self.assertEqual(
+            by_type["details_changed"]["new_value"]["description"],
+            "new description",
+        )
+        self.assertEqual(by_type["details_changed"]["old_value"]["validity_days"], 30)
+        self.assertEqual(by_type["details_changed"]["new_value"]["validity_days"], 60)
+
+    def test_first_snapshot_establishes_baseline_without_changes(self):
+        rows = [{
+            "site": "https://a.example",
+            "site_host": "a.example",
+            "record_type": "group",
+            "model_category": "OpenAI",
+            "group_id": "baseline",
+            "group_name": "baseline",
+            "rate_multiplier": 1,
+        }]
+
+        snapshot = app.write_price_snapshot(rows, {"site_count": 1})
+
+        self.assertEqual(snapshot["changes"], [])
+        self.assertEqual(app.load_price_changes(), [])
+
+    def test_recovery_compares_with_last_successful_baseline(self):
+        healthy = [{
+            "site": "https://a.example",
+            "site_host": "a.example",
+            "record_type": "group",
+            "model_category": "OpenAI",
+            "group_id": "primary",
+            "group_name": "primary",
+            "rate_multiplier": 1,
+        }]
+        failed = [{
+            "site": "https://a.example",
+            "site_host": "a.example",
+            "record_type": "error",
+            "model_category": "未获取",
+            "error": "temporary failure",
+            "status_label": "网络错误",
+        }]
+        recovered = [{**healthy[0], "rate_multiplier": 1.5}]
+
+        app.write_price_snapshot(healthy, {"site_count": 1, "success_count": 1})
+        failed_snapshot = app.write_price_snapshot(
+            failed,
+            {"site_count": 1, "success_count": 0, "error_count": 1},
+        )
+        recovered_snapshot = app.write_price_snapshot(
+            recovered,
+            {"site_count": 1, "success_count": 1, "error_count": 0},
+        )
+
+        self.assertIn("site_error", {
+            change["change_type"] for change in failed_snapshot["changes"]
+        })
+        recovered_types = {
+            change["change_type"] for change in recovered_snapshot["changes"]
+        }
+        self.assertIn("rate_changed", recovered_types)
+        self.assertNotIn("added", recovered_types)
+
+    def test_acknowledged_changes_are_persisted(self):
+        app.write_price_changes([
+            {
+                "id": "one",
+                "change_type": "rate_changed",
+                "acknowledged": False,
+            },
+            {
+                "id": "two",
+                "change_type": "added",
+                "acknowledged": False,
+            },
+        ])
+
+        app.acknowledge_price_changes(["one"])
+        persisted = {change["id"]: change for change in app.load_price_changes()}
+
+        self.assertTrue(persisted["one"]["acknowledged"])
+        self.assertFalse(persisted["two"]["acknowledged"])
+
+    def test_auto_refresh_false_survives_save_reload_and_status_update(self):
+        api = self.new_api()
+        result = api.save_site(
+            "disabled",
+            "https://disabled.example",
+            auto_refresh=False,
+        )
+
+        self.assertTrue(result["ok"])
+        saved = app.load_saved_sites()[0]
+        self.assertFalse(saved["auto_refresh"])
+
+        annotated = api._update_site_status(saved, {"ok": True, "rows": []})
+        reloaded = app.load_saved_sites()[0]
+        self.assertFalse(reloaded["auto_refresh"])
+        self.assertFalse(annotated[0]["auto_refresh"])
+
+        api._cache_state(saved_sites=annotated)
+        state = api.initial_state()
+        self.assertFalse(state["saved_sites"][0]["auto_refresh"])
+
+    def test_automatic_updates_skip_disabled_sites_but_manual_update_includes_them(self):
+        records = [
+            {
+                "name": "enabled",
+                "site": "https://enabled.example",
+                "api_base": "/api/v1",
+                "interval_minutes": 180,
+                "next_run": "2000-01-01T00:00:00+00:00",
+                "auto_refresh": True,
+            },
+            {
+                "name": "disabled",
+                "site": "https://disabled.example",
+                "api_base": "/api/v1",
+                "interval_minutes": 180,
+                "next_run": "2000-01-01T00:00:00+00:00",
+                "auto_refresh": False,
+            },
+        ]
+
+        def run_update(reason, only_due):
+            app.write_saved_sites(records)
+            api = self.new_api()
+            captured = []
+
+            def successful_capture(instance, record, include_groups=True, worker_slot=0):
+                captured.append(record["site"])
+                return {
+                    "ok": True,
+                    "rows": [{
+                        "site": record["site"],
+                        "site_host": app.urlparse(record["site"]).netloc,
+                        "status": "ok",
+                        "source": "test",
+                        "record_type": "group",
+                        "model_category": "OpenAI",
+                        "group_id": record["name"],
+                        "group_name": record["name"],
+                        "rate_multiplier": 1,
+                        "fetched_at": datetime.now(timezone.utc).isoformat(),
+                    }],
+                }
+
+            api._capture_site_webview = types.MethodType(successful_capture, api)
+            result = api.start_update_all_prices(reason, only_due)
+            self.assertTrue(result["accepted"])
+            deadline = time.monotonic() + 3
+            while api.update_thread and api.update_thread.is_alive() and time.monotonic() < deadline:
+                time.sleep(0.01)
+            self.assertFalse(api.update_thread and api.update_thread.is_alive())
+            self.assertEqual(api.update_job["status"], "completed")
+            return set(captured)
+
+        enabled = {"https://enabled.example"}
+        both = {"https://enabled.example", "https://disabled.example"}
+        self.assertEqual(run_update("startup", False), enabled)
+        self.assertEqual(run_update("scheduler", True), enabled)
+        self.assertEqual(run_update("manual", False), both)
+
+    def test_control_html_wires_change_history_and_monitor_controls(self):
+        html = app.CONTROL_HTML
+        save_site_block = html.split("async function saveSite()", 1)[1].split(
+            "async function deleteSite()",
+            1,
+        )[0]
+        runtime_block = html.split("function applyRuntimeStatus(result)", 1)[1].split(
+            "async function pollSchedulerStatus()",
+            1,
+        )[0]
+        render_changes_block = html.split("function renderChanges()", 1)[1].split(
+            "function applySavedSite(site)",
+            1,
+        )[0]
+        update_all_block = html.split("async function updateAllSaved(reason = 'manual')", 1)[1].split(
+            "async function startAutoCheck()",
+            1,
+        )[0]
+        init_block = html.split("async function init()", 1)[1].split(
+            "siteInput.addEventListener",
+            1,
+        )[0]
+
+        self.assertIn("autoRefreshInput.checked", save_site_block)
+        self.assertIn("state.changes", init_block)
+        self.assertIn("result.changes", runtime_block)
+        self.assertIn("window.pywebview.api.acknowledge_changes", html)
+        self.assertIn("const hasPercent = item.change_percent !== null", render_changes_block)
+        self.assertIn("hasPercent && Number.isFinite", render_changes_block)
+        self.assertIn("result.message || '没有需要更新的站点'", update_all_block)
+        for element_id in (
+            "changeSearchInput",
+            "changeSiteFilterSelect",
+            "changeTypeFilterSelect",
+            "unreadOnlyInput",
+            "acknowledgeChangesBtn",
+        ):
+            self.assertIn(f"{element_id}.addEventListener", html)
+
     def test_log_redaction_removes_tokens(self):
         text = app.redact_log_text(
             "Authorization: Bearer abc.def-123 and sk-abcdefghijklmnopqrstuvwxyz"
