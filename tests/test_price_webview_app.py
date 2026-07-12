@@ -412,6 +412,44 @@ class PriceAppLifecycleTests(unittest.TestCase):
         self.assertEqual(saved_payload["generated_at"], payload["generated_at"])
         self.assertFalse(list(pathlib.Path(self.temporary_directory.name).rglob("*.tmp")))
 
+    def test_refresh_replaces_all_old_rows_for_the_updated_site(self):
+        previous = [
+            {"site": "https://a.example", "site_host": "a.example", "record_type": "group", "group_id": "old"},
+            {"site": "https://a.example", "site_host": "a.example", "record_type": "plan", "plan_id": "gone"},
+            {"site": "https://b.example", "site_host": "b.example", "record_type": "group", "group_id": "keep"},
+        ]
+        fresh = [
+            {"site": "https://a.example", "site_host": "a.example", "record_type": "group", "group_id": "current"},
+        ]
+
+        rows = app.replace_price_rows(previous, fresh, ["https://a.example"])
+
+        self.assertEqual(
+            {(row["site_host"], row.get("group_id") or row.get("plan_id")) for row in rows},
+            {("a.example", "current"), ("b.example", "keep")},
+        )
+
+    def test_failed_refresh_replaces_stale_prices_with_current_error(self):
+        previous = [{
+            "site": "https://a.example",
+            "site_host": "a.example",
+            "record_type": "group",
+            "group_id": "stale-price",
+            "rate_multiplier": 0.1,
+        }]
+        fresh = [{
+            "site": "https://a.example",
+            "site_host": "a.example",
+            "record_type": "error",
+            "error": "current failure",
+        }]
+
+        rows = app.replace_price_rows(previous, fresh, ["https://a.example"])
+
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["record_type"], "error")
+        self.assertEqual(rows[0]["error"], "current failure")
+
     def test_log_redaction_removes_tokens(self):
         text = app.redact_log_text(
             "Authorization: Bearer abc.def-123 and sk-abcdefghijklmnopqrstuvwxyz"

@@ -76,7 +76,7 @@ OUTPUT_FIELDS = [
 
 
 APP_NAME = "Sub2APIPriceMonitor"
-APP_VERSION = "0.1.13"
+APP_VERSION = "1.0.0"
 APP_WINDOW_TITLE = "Sub2API 中转站比价"
 LOGGER = logging.getLogger(APP_NAME)
 SHUTDOWN_JOIN_TIMEOUT_SECONDS = 1.0
@@ -757,6 +757,30 @@ def merge_price_rows(previous_rows, fresh_rows):
     return rows
 
 
+def replace_price_rows(previous_rows, fresh_rows, refreshed_sites):
+    refreshed_hosts = set()
+    for site in refreshed_sites or []:
+        try:
+            host = urlparse(normalize_site(site)).netloc.lower()
+        except (TypeError, ValueError):
+            host = ""
+        if host:
+            refreshed_hosts.add(host)
+
+    retained_rows = []
+    for row in previous_rows or []:
+        if not isinstance(row, dict):
+            continue
+        host = str(
+            row.get("site_host")
+            or urlparse(str(row.get("site") or "")).netloc
+            or ""
+        ).lower()
+        if host not in refreshed_hosts:
+            retained_rows.append(row)
+    return merge_price_rows(retained_rows, fresh_rows)
+
+
 COLLECTOR_JS = r"""
 (async function run(options) {
   const tokenKeys = ['auth_token', 'access_token'];
@@ -1113,332 +1137,389 @@ CONTROL_HTML = r"""<!doctype html>
   <title>Sub2API 中转站比价</title>
   <style>
     * { box-sizing: border-box; }
+    :root {
+      color-scheme: light;
+      --bg: #f4f5f7;
+      --panel: #ffffff;
+      --panel-muted: #fafafa;
+      --border: #e2e4e9;
+      --border-strong: #cfd3da;
+      --text: #18181b;
+      --muted: #6b7280;
+      --accent: #f97316;
+      --accent-soft: #fff1e8;
+      --blue: #2563eb;
+      --green: #15803d;
+      --red: #b91c1c;
+    }
+    html, body { width: 100%; height: 100%; }
     body {
       margin: 0;
-      background: #f5f7fa;
-      color: #18202a;
+      overflow: hidden;
+      background: var(--bg);
+      color: var(--text);
       font-family: "Segoe UI", "Microsoft YaHei", Arial, sans-serif;
     }
-    .app { min-height: 100vh; display: grid; grid-template-rows: auto auto 1fr; }
-    header {
-      display: flex;
-      align-items: center;
-      justify-content: space-between;
-      gap: 14px;
-      padding: 16px 18px;
-      border-bottom: 1px solid #dfe5ec;
-      background: #ffffff;
-    }
-    h1 { margin: 0; font-size: 18px; }
-    .status { color: #5b6877; font-size: 12px; }
-    .header-meta { display: flex; align-items: center; gap: 10px; white-space: nowrap; }
-    .controls {
-      display: grid;
-      grid-template-columns: repeat(6, minmax(104px, 1fr));
-      gap: 10px;
-      align-items: end;
-      padding: 14px 18px;
-      border-bottom: 1px solid #dfe5ec;
-      background: #ffffff;
-    }
-    .field-wide { grid-column: span 2; }
-    label { display: grid; gap: 5px; color: #5b6877; font-size: 12px; font-weight: 650; }
-    input[type="url"], input[type="text"], input[type="number"], input[type="search"], select {
-      width: 100%;
-      height: 36px;
-      border: 1px solid #cbd5e1;
-      border-radius: 6px;
-      padding: 0 10px;
-      color: #18202a;
-      font-size: 13px;
-    }
-    input:focus { border-color: #2563eb; outline: 3px solid rgba(37, 99, 235, 0.12); }
-    .toggle { display: flex; align-items: center; gap: 7px; height: 36px; color: #344253; }
+    button, input, select { font: inherit; }
     button {
       height: 36px;
-      border: 1px solid #cbd5e1;
-      border-radius: 6px;
-      background: #fff;
-      color: #18202a;
+      border: 1px solid var(--border-strong);
+      border-radius: 7px;
+      background: var(--panel);
+      color: var(--text);
       cursor: pointer;
-      font-weight: 700;
+      font-weight: 650;
       padding: 0 12px;
       white-space: nowrap;
     }
-    button.primary { border-color: #1f6feb; background: #1f6feb; color: #fff; }
+    button:hover:not(:disabled) { border-color: #aeb4bd; background: #f8f8f9; }
     button:disabled { cursor: not-allowed; opacity: 0.45; }
-    .summary {
-      display: grid;
-      grid-template-columns: repeat(4, minmax(0, 1fr));
-      gap: 10px;
-      padding: 14px 18px 0;
+    button.primary { border-color: var(--accent); background: var(--accent); color: #fff; }
+    button.primary:hover:not(:disabled) { border-color: #ea580c; background: #ea580c; }
+    button.danger { color: var(--red); }
+    input[type="url"], input[type="text"], input[type="number"], input[type="search"], select {
+      width: 100%;
+      height: 36px;
+      border: 1px solid var(--border-strong);
+      border-radius: 7px;
+      padding: 0 10px;
+      background: #fff;
+      color: var(--text);
+      font-size: 13px;
     }
-    .metric {
-      border: 1px solid #dfe5ec;
-      border-radius: 8px;
-      background: #ffffff;
-      padding: 10px 12px;
-    }
-    .metric span { display: block; color: #64748b; font-size: 12px; }
-    .metric strong { display: block; margin-top: 4px; font-size: 18px; }
-    .content {
-      min-height: 0;
-      display: grid;
-      grid-template-rows: auto auto auto minmax(260px, 1fr) auto 152px;
-      gap: 12px;
-      padding: 14px 18px 18px;
-    }
-    .tabs {
+    input:focus, select:focus { border-color: var(--blue); outline: 3px solid rgba(37, 99, 235, 0.11); }
+    label { display: grid; gap: 6px; color: #525866; font-size: 12px; font-weight: 650; }
+    [hidden] { display: none !important; }
+    .app-shell { height: 100vh; display: grid; grid-template-columns: 218px minmax(0, 1fr); }
+    .sidebar {
+      min-width: 0;
       display: flex;
-      flex-wrap: wrap;
-      gap: 8px;
+      flex-direction: column;
+      gap: 18px;
+      padding: 18px 14px 14px;
+      border-right: 1px solid var(--border);
+      background: #fbfbfc;
     }
-    .tab-button {
-      height: 32px;
-      border-radius: 999px;
-      padding: 0 14px;
-      font-size: 12px;
-    }
-    .tab-button.active {
-      border-color: #1f6feb;
-      background: #1f6feb;
+    .brand { display: flex; align-items: center; gap: 10px; padding: 0 4px; }
+    .brand-mark {
+      display: grid;
+      place-items: center;
+      width: 38px;
+      height: 38px;
+      border-radius: 8px;
+      background: var(--accent);
       color: #fff;
-    }
-    .category-strip {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
-      gap: 10px;
-    }
-    .filter-bar {
-      display: grid;
-      grid-template-columns: minmax(220px, 2fr) repeat(4, minmax(120px, 1fr));
-      gap: 10px;
-      align-items: end;
-    }
-    .category-card {
-      border: 1px solid #dfe5ec;
-      border-radius: 8px;
-      background: #fff;
-      padding: 10px 12px;
-    }
-    .category-card strong { display: block; font-size: 14px; }
-    .category-card span { display: block; margin-top: 4px; color: #64748b; font-size: 12px; }
-    .table-wrap {
-      min-height: 260px;
-      overflow: auto;
-      border: 1px solid #dfe5ec;
-      border-radius: 8px;
-      background: #fff;
-    }
-    table { width: 100%; min-width: 1080px; border-collapse: collapse; font-size: 12px; }
-    th, td { border-bottom: 1px solid #edf1f5; padding: 9px 10px; text-align: left; vertical-align: top; }
-    th { position: sticky; top: 0; background: #f8fafc; color: #526174; font-weight: 800; }
-    td small { display: block; color: #64748b; margin-top: 3px; line-height: 1.35; }
-    .group-row td {
-      position: sticky;
-      top: 34px;
-      background: #eef4ff;
-      color: #16437e;
       font-weight: 800;
       letter-spacing: 0;
     }
-    .subgroup-row td {
-      background: #f8fbff;
-      color: #31516f;
-      font-weight: 800;
-    }
-    .category-badge {
-      display: inline-block;
-      min-width: 72px;
-      border-radius: 999px;
-      background: #eaf2ff;
-      color: #185abc;
-      padding: 2px 8px;
-      font-weight: 800;
-    }
-    .empty { color: #778397; text-align: center; }
-    .pager {
+    .brand-copy { min-width: 0; }
+    .brand-copy strong { display: block; font-size: 15px; }
+    .brand-copy span { display: block; margin-top: 2px; color: var(--muted); font-size: 11px; }
+    .side-label { padding: 0 5px; color: #8a909b; font-size: 11px; font-weight: 750; text-transform: uppercase; }
+    .side-nav { display: grid; gap: 5px; }
+    .nav-item {
+      width: 100%;
       display: flex;
       align-items: center;
-      justify-content: flex-end;
-      gap: 8px;
-      min-height: 32px;
-      color: #64748b;
-      font-size: 12px;
+      justify-content: flex-start;
+      gap: 10px;
+      height: 40px;
+      border-color: transparent;
+      background: transparent;
+      color: #4b5563;
+      text-align: left;
     }
-    .pager button {
-      width: 34px;
-      height: 32px;
-      padding: 0;
-      font-size: 18px;
-      line-height: 1;
-    }
-    .pager[hidden] { display: none; }
-    .console {
-      min-height: 0;
-      border: 1px solid #1c2c3d;
+    .nav-item.active { border-color: #fed7aa; background: var(--accent-soft); color: #c2410c; }
+    .nav-icon { width: 22px; color: currentColor; text-align: center; font-weight: 800; }
+    .site-picker { display: grid; gap: 8px; }
+    .site-count { color: var(--muted); font-size: 11px; }
+    .side-spacer { flex: 1; }
+    .side-status {
+      padding: 11px;
+      border: 1px solid var(--border);
       border-radius: 8px;
-      overflow: hidden;
-      background: #0c1219;
-      box-shadow: 0 12px 28px rgba(15, 23, 32, 0.12);
+      background: #fff;
     }
-    .console-head {
-      display: flex;
+    .side-status span { display: block; color: var(--muted); font-size: 11px; }
+    .side-status strong { display: block; margin-top: 4px; font-size: 12px; overflow-wrap: anywhere; }
+    .workspace { min-width: 0; min-height: 0; display: grid; grid-template-rows: 72px minmax(0, 1fr); }
+    .topbar {
+      min-width: 0;
+      display: grid;
+      grid-template-columns: minmax(150px, 0.7fr) minmax(340px, 1.4fr) auto;
       align-items: center;
-      justify-content: space-between;
-      padding: 8px 10px;
-      border-bottom: 1px solid #1d2b3a;
-      background: #111b26;
-      color: #d7e3f1;
-      font-size: 12px;
-      font-weight: 800;
+      gap: 16px;
+      padding: 12px 18px;
+      border-bottom: 1px solid var(--border);
+      background: rgba(255, 255, 255, 0.96);
     }
-    .console-head span:last-child {
-      color: #8fb3da;
-      font-weight: 700;
+    .page-heading { min-width: 0; }
+    .page-heading h1 { margin: 0; font-size: 18px; letter-spacing: 0; }
+    .page-heading span { display: block; margin-top: 4px; color: var(--muted); font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .tabs {
+      min-width: 0;
+      display: grid;
+      grid-template-columns: repeat(5, minmax(58px, 1fr));
+      gap: 4px;
+      padding: 5px;
+      border: 1px solid #e8e8eb;
+      border-radius: 8px;
+      background: #f2f2f4;
     }
-    .log {
-      overflow: auto;
-      height: calc(100% - 34px);
-      color: #c9d5e2;
+    .tab-button { height: 36px; border-color: transparent; background: transparent; padding: 0 8px; font-size: 12px; }
+    .tab-button.active { border-color: var(--border); background: #fff; color: #111827; box-shadow: 0 2px 7px rgba(17, 24, 39, 0.08); }
+    .top-actions { display: flex; align-items: center; justify-content: flex-end; gap: 7px; }
+    .top-actions button { padding: 0 10px; }
+    .view-host { min-width: 0; min-height: 0; overflow: hidden; }
+    .view { width: 100%; height: 100%; min-width: 0; min-height: 0; }
+    .price-view {
+      display: grid;
+      grid-template-rows: auto auto auto minmax(260px, 1fr) auto;
+      gap: 12px;
+      padding: 16px 18px 14px;
+      overflow: hidden;
+    }
+    .summary { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
+    .metric { border: 1px solid var(--border); border-radius: 8px; background: var(--panel); padding: 11px 13px; }
+    .metric span { display: block; color: var(--muted); font-size: 11px; }
+    .metric strong { display: block; margin-top: 4px; font-size: 18px; letter-spacing: 0; }
+    .metric:last-child strong { font-size: 13px; line-height: 1.45; }
+    .category-strip { display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 10px; }
+    .category-card { min-width: 0; border: 1px solid var(--border); border-radius: 8px; background: var(--panel); padding: 9px 11px; }
+    .category-card strong { display: block; font-size: 13px; }
+    .category-card span { display: block; margin-top: 4px; color: var(--muted); font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .filter-bar {
+      display: grid;
+      grid-template-columns: minmax(190px, 1.7fr) minmax(130px, 1fr) minmax(105px, 0.7fr) minmax(100px, 0.7fr) auto;
+      gap: 9px;
+      align-items: end;
       padding: 10px;
-      font: 12px/1.5 Consolas, "Microsoft YaHei", monospace;
-      white-space: pre-wrap;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--panel);
     }
-    @media (max-width: 980px) {
-      .controls { grid-template-columns: 1fr 1fr; }
-      .filter-bar { grid-template-columns: 1fr 1fr; }
-      .summary { grid-template-columns: 1fr; }
+    .toggle { display: flex; align-items: center; gap: 7px; min-height: 36px; color: #4b5563; }
+    .table-wrap { min-height: 260px; overflow: auto; border: 1px solid var(--border); border-radius: 8px; background: var(--panel); }
+    table { width: 100%; min-width: 1040px; border-collapse: collapse; font-size: 12px; }
+    th, td { border-bottom: 1px solid #eceef1; padding: 9px 10px; text-align: left; vertical-align: top; }
+    th { position: sticky; top: 0; z-index: 2; background: #f7f7f8; color: #555d69; font-weight: 750; }
+    tbody tr:hover td { background: #fafafa; }
+    td small { display: block; color: var(--muted); margin-top: 3px; line-height: 1.35; }
+    .subgroup-row td { background: #fff7ed; color: #9a3412; font-weight: 750; }
+    .category-badge { display: inline-block; min-width: 68px; border-radius: 6px; background: #eef2ff; color: #3730a3; padding: 2px 7px; font-weight: 750; }
+    .empty { color: #818794; text-align: center; padding: 34px 10px; }
+    .pager { display: flex; align-items: center; justify-content: flex-end; gap: 8px; min-height: 32px; color: var(--muted); font-size: 12px; }
+    .pager button { width: 34px; height: 32px; padding: 0; font-size: 18px; }
+    .site-view { padding: 18px; overflow: auto; }
+    .section-head { display: flex; align-items: flex-end; justify-content: space-between; gap: 14px; margin-bottom: 16px; }
+    .section-head h2 { margin: 0; font-size: 18px; }
+    .section-head p { margin: 5px 0 0; color: var(--muted); font-size: 12px; }
+    .settings-layout { display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(270px, 0.75fr); gap: 14px; align-items: start; }
+    .tool-panel { border: 1px solid var(--border); border-radius: 8px; background: var(--panel); padding: 16px; }
+    .tool-panel h3 { margin: 0 0 14px; font-size: 14px; }
+    .settings-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
+    .field-wide { grid-column: 1 / -1; }
+    .toggle-list { display: grid; gap: 8px; margin-bottom: 14px; }
+    .action-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; }
+    .action-grid .wide { grid-column: 1 / -1; }
+    .logs-view { padding: 18px; }
+    .console { height: 100%; min-height: 0; border: 1px solid #202833; border-radius: 8px; overflow: hidden; background: #0d1117; }
+    .console-head { display: flex; align-items: center; justify-content: space-between; height: 40px; padding: 0 12px; border-bottom: 1px solid #252d38; background: #151b23; color: #e5e7eb; font-size: 12px; font-weight: 750; }
+    .console-head span:last-child { color: #93c5fd; }
+    .log { height: calc(100% - 40px); overflow: auto; padding: 12px; color: #c9d1d9; font: 12px/1.55 Consolas, "Microsoft YaHei", monospace; white-space: pre-wrap; }
+    @media (max-width: 900px) {
+      .app-shell { grid-template-columns: 178px minmax(0, 1fr); }
+      .workspace { grid-template-rows: 116px minmax(0, 1fr); }
+      .topbar { grid-template-columns: minmax(130px, 1fr) auto; grid-template-rows: auto auto; gap: 8px 12px; }
+      .tabs { grid-column: 1 / -1; grid-row: 2; }
+      .top-actions { grid-column: 2; grid-row: 1; }
+      .category-strip { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .filter-bar { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+      .price-view { grid-template-rows: auto auto auto 360px auto; overflow: auto; }
+      .settings-layout { grid-template-columns: 1fr; }
     }
   </style>
 </head>
 <body>
-  <main class="app">
-    <header>
-      <div>
-        <h1>Sub2API 中转站比价</h1>
-        <div class="status" id="status">等待登录</div>
-      </div>
-      <div class="header-meta status"><span>v__APP_VERSION__</span><span id="rowCount">0 行</span></div>
-    </header>
-
-    <section class="controls">
-      <label class="field-wide">
-        已保存站点
-        <select id="savedSiteSelect"></select>
-      </label>
-      <label class="field-wide">
-        站点地址
-        <input id="siteInput" type="url" spellcheck="false" placeholder="https://example.com" />
-      </label>
-      <label>
-        API 路径
-        <input id="apiBaseInput" type="text" spellcheck="false" value="/api/v1" />
-      </label>
-      <label>
-        保存备注
-        <input id="siteNameInput" type="text" spellcheck="false" placeholder="默认使用站点地址，可自行备注" />
-      </label>
-      <label>
-        间隔(小时)
-        <input id="intervalHoursInput" type="number" min="0.05" step="0.25" value="3" />
-      </label>
-      <label class="toggle">
-        <input id="includeGroupsInput" type="checkbox" checked />
-        分组行
-      </label>
-      <label class="toggle">
-        <input id="rememberCredentialsInput" type="checkbox" checked />
-        保存密码
-      </label>
-      <label class="toggle">
-        <input id="autoLoginInput" type="checkbox" checked />
-        自动登录
-      </label>
-      <button id="saveSiteBtn" type="button">保存站点</button>
-      <button id="deleteSiteBtn" type="button">删除站点</button>
-      <button id="clearCredentialsBtn" type="button">清除密码</button>
-      <button id="openSiteBtn" type="button">WebView登录</button>
-      <button id="refreshLoginBtn" type="button">手动刷新验证页</button>
-      <button id="hideLoginBtn" type="button">暂时跳过本站</button>
-      <button id="captureBtn" type="button" class="primary">WebView抓取</button>
-      <button id="updateAllBtn" type="button">更新全部</button>
-      <button id="exportCsvBtn" type="button" disabled>导出 CSV</button>
-      <button id="exportJsonBtn" type="button" disabled>导出 JSON</button>
-    </section>
-
-    <section class="summary">
-      <div class="metric"><span>套餐</span><strong id="planCount">0</strong></div>
-      <div class="metric"><span>分组</span><strong id="groupCount">0</strong></div>
-      <div class="metric"><span>模型分类</span><strong id="categoryCount">0</strong></div>
-      <div class="metric"><span>状态</span><strong id="stateBadge">待登录</strong></div>
-    </section>
-
-    <section class="content">
-      <div class="tabs" id="categoryTabs"></div>
-      <div class="category-strip" id="categoryStrip"></div>
-      <div class="filter-bar">
-        <label>
-          搜索
-          <input id="filterInput" type="search" spellcheck="false" placeholder="站点、分组、套餐、平台" />
-        </label>
-        <label>
-          站点
-          <select id="siteFilterSelect"></select>
-        </label>
-        <label>
-          类型
-          <select id="typeFilterSelect">
-            <option value="">全部</option>
-            <option value="plan">套餐</option>
-            <option value="group">分组</option>
-            <option value="error">错误</option>
-          </select>
-        </label>
-        <label>
-          最高倍率
-          <input id="maxRateInput" type="number" min="0" step="0.01" placeholder="不限" />
-        </label>
-        <label class="toggle">
-          <input id="priceOnlyInput" type="checkbox" />
-          只看有价格/倍率
-        </label>
-      </div>
-      <div class="table-wrap">
-        <table>
-          <thead>
-            <tr>
-              <th>类型</th>
-              <th>站点</th>
-              <th>模型分类</th>
-              <th>分组</th>
-              <th>平台</th>
-              <th>套餐</th>
-              <th>价格</th>
-              <th>CNY</th>
-              <th>有效期</th>
-              <th>倍率</th>
-            </tr>
-          </thead>
-          <tbody id="resultBody">
-            <tr><td colspan="10" class="empty">暂无数据</td></tr>
-          </tbody>
-        </table>
-      </div>
-      <div class="pager" id="pager">
-        <button id="prevPageBtn" type="button" aria-label="上一页" title="上一页">&lsaquo;</button>
-        <span id="pageStatus">1 / 1</span>
-        <button id="nextPageBtn" type="button" aria-label="下一页" title="下一页">&rsaquo;</button>
-      </div>
-      <div class="console">
-        <div class="console-head">
-          <span>运行控制台</span>
-          <span id="consoleStatus">ready</span>
+  <div class="app-shell">
+    <aside class="sidebar">
+      <div class="brand">
+        <div class="brand-mark">S2</div>
+        <div class="brand-copy">
+          <strong>Sub2API Monitor</strong>
+          <span>中转站当前价格</span>
         </div>
-        <div class="log" id="logBox"></div>
       </div>
-    </section>
-  </main>
+
+      <div>
+        <div class="side-label">工作区</div>
+        <nav class="side-nav" aria-label="工作区导航">
+          <button class="nav-item active" type="button" data-view="prices"><span class="nav-icon">¥</span>当前价格</button>
+          <button class="nav-item" type="button" data-view="sites"><span class="nav-icon">S</span>站点与授权</button>
+          <button class="nav-item" type="button" data-view="logs"><span class="nav-icon">›_</span>运行日志</button>
+        </nav>
+      </div>
+
+      <div class="site-picker">
+        <div class="side-label">当前站点</div>
+        <select id="savedSiteSelect" aria-label="选择已保存站点"></select>
+        <span class="site-count" id="siteCountLabel">0 个已保存站点</span>
+      </div>
+
+      <div class="side-spacer"></div>
+      <div class="side-status">
+        <span>运行状态 · v__APP_VERSION__</span>
+        <strong id="status">等待登录</strong>
+      </div>
+    </aside>
+
+    <main class="workspace">
+      <header class="topbar">
+        <div class="page-heading">
+          <h1 id="viewTitle">当前价格</h1>
+          <span id="snapshotTime">尚未生成价格快照</span>
+        </div>
+        <div class="tabs" id="categoryTabs"></div>
+        <div class="top-actions">
+          <button id="updateAllBtn" type="button" title="更新所有站点">↻ 更新全部</button>
+          <button id="exportCsvBtn" type="button" title="导出 CSV" disabled>↓ CSV</button>
+          <button id="exportJsonBtn" type="button" title="导出 JSON" disabled>↓ JSON</button>
+        </div>
+      </header>
+
+      <div class="view-host">
+        <section class="view price-view" id="pricesView">
+          <div class="summary">
+            <div class="metric"><span>当前套餐</span><strong id="planCount">0</strong></div>
+            <div class="metric"><span>当前分组</span><strong id="groupCount">0</strong></div>
+            <div class="metric"><span>模型分类</span><strong id="categoryCount">0</strong></div>
+            <div class="metric"><span>状态</span><strong id="stateBadge">待更新</strong></div>
+          </div>
+
+          <div class="category-strip" id="categoryStrip"></div>
+
+          <div class="filter-bar">
+            <label>
+              搜索
+              <input id="filterInput" type="search" spellcheck="false" placeholder="站点、分组、套餐、平台" />
+            </label>
+            <label>
+              站点
+              <select id="siteFilterSelect"></select>
+            </label>
+            <label>
+              类型
+              <select id="typeFilterSelect">
+                <option value="">全部</option>
+                <option value="plan">套餐</option>
+                <option value="group">分组</option>
+                <option value="error">错误</option>
+              </select>
+            </label>
+            <label>
+              最高倍率
+              <input id="maxRateInput" type="number" min="0" step="0.01" placeholder="不限" />
+            </label>
+            <label class="toggle">
+              <input id="priceOnlyInput" type="checkbox" />
+              只看价格/倍率
+            </label>
+          </div>
+
+          <div class="table-wrap">
+            <table>
+              <thead>
+                <tr>
+                  <th>类型</th>
+                  <th>站点</th>
+                  <th>模型分类</th>
+                  <th>分组</th>
+                  <th>平台</th>
+                  <th>套餐</th>
+                  <th>价格</th>
+                  <th>CNY</th>
+                  <th>有效期</th>
+                  <th>倍率</th>
+                </tr>
+              </thead>
+              <tbody id="resultBody">
+                <tr><td colspan="10" class="empty">暂无当前价格</td></tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="pager" id="pager">
+            <span id="rowCount">0 行</span>
+            <button id="prevPageBtn" type="button" aria-label="上一页" title="上一页">&lsaquo;</button>
+            <span id="pageStatus">1 / 1</span>
+            <button id="nextPageBtn" type="button" aria-label="下一页" title="下一页">&rsaquo;</button>
+          </div>
+        </section>
+
+        <section class="view site-view" id="sitesView" hidden>
+          <div class="section-head">
+            <div>
+              <h2>站点与授权</h2>
+              <p>保存站点配置，登录后抓取当前套餐和分组倍率。</p>
+            </div>
+          </div>
+
+          <div class="settings-layout">
+            <section class="tool-panel">
+              <h3>站点配置</h3>
+              <div class="settings-grid">
+                <label class="field-wide">
+                  站点地址
+                  <input id="siteInput" type="url" spellcheck="false" placeholder="https://example.com" />
+                </label>
+                <label>
+                  保存备注
+                  <input id="siteNameInput" type="text" spellcheck="false" placeholder="默认使用站点地址" />
+                </label>
+                <label>
+                  API 路径
+                  <input id="apiBaseInput" type="text" spellcheck="false" value="/api/v1" />
+                </label>
+                <label>
+                  更新间隔（小时）
+                  <input id="intervalHoursInput" type="number" min="0.05" step="0.25" value="3" />
+                </label>
+              </div>
+            </section>
+
+            <section class="tool-panel">
+              <h3>授权与操作</h3>
+              <div class="toggle-list">
+                <label class="toggle"><input id="includeGroupsInput" type="checkbox" checked />包含分组倍率</label>
+                <label class="toggle"><input id="rememberCredentialsInput" type="checkbox" checked />保存密码到 Windows 凭据管理器</label>
+                <label class="toggle"><input id="autoLoginInput" type="checkbox" checked />允许自动填写与登录</label>
+              </div>
+              <div class="action-grid">
+                <button id="saveSiteBtn" type="button">保存站点</button>
+                <button id="clearCredentialsBtn" type="button">清除密码</button>
+                <button id="openSiteBtn" type="button" class="wide">打开 WebView 登录</button>
+                <button id="refreshLoginBtn" type="button">手动刷新验证页</button>
+                <button id="hideLoginBtn" type="button">暂时跳过本站</button>
+                <button id="captureBtn" type="button" class="primary wide">抓取当前价格</button>
+                <button id="deleteSiteBtn" type="button" class="danger wide">删除站点</button>
+              </div>
+            </section>
+          </div>
+        </section>
+
+        <section class="view logs-view" id="logsView" hidden>
+          <div class="console">
+            <div class="console-head">
+              <span>运行日志</span>
+              <span id="consoleStatus">ready</span>
+            </div>
+            <div class="log" id="logBox"></div>
+          </div>
+        </section>
+      </div>
+    </main>
+  </div>
 
   <script>
     const siteInput = document.querySelector('#siteInput');
@@ -1479,6 +1560,13 @@ CONTROL_HTML = r"""<!doctype html>
     const prevPageBtn = document.querySelector('#prevPageBtn');
     const nextPageBtn = document.querySelector('#nextPageBtn');
     const pageStatus = document.querySelector('#pageStatus');
+    const viewTitle = document.querySelector('#viewTitle');
+    const snapshotTime = document.querySelector('#snapshotTime');
+    const siteCountLabel = document.querySelector('#siteCountLabel');
+    const pricesView = document.querySelector('#pricesView');
+    const sitesView = document.querySelector('#sitesView');
+    const logsView = document.querySelector('#logsView');
+    const navItems = [...document.querySelectorAll('.nav-item[data-view]')];
     let rows = [];
     let savedSites = [];
     let latestGeneratedAt = '';
@@ -1504,6 +1592,7 @@ CONTROL_HTML = r"""<!doctype html>
     const deferredReauthSites = new Set();
     let noteTouched = false;
     let lastAutoNote = '';
+    let activeView = 'prices';
     const CATEGORY_ORDER = [
       'OpenAI',
       'Anthropic',
@@ -1541,6 +1630,20 @@ CONTROL_HTML = r"""<!doctype html>
       statusText.textContent = text;
       stateBadge.textContent = text;
       consoleStatus.textContent = text;
+    }
+
+    function setView(view) {
+      const views = { prices: pricesView, sites: sitesView, logs: logsView };
+      const titles = { prices: '当前价格', sites: '站点与授权', logs: '运行日志' };
+      activeView = views[view] ? view : 'prices';
+      for (const [name, element] of Object.entries(views)) {
+        element.hidden = name !== activeView;
+      }
+      for (const button of navItems) {
+        button.classList.toggle('active', button.dataset.view === activeView);
+      }
+      viewTitle.textContent = titles[activeView];
+      if (activeView === 'prices') render();
     }
 
     function categoryRank(category) {
@@ -1694,7 +1797,8 @@ CONTROL_HTML = r"""<!doctype html>
         button.addEventListener('click', () => {
           activeCategory = button.dataset.category || '';
           currentPage = 0;
-          render();
+          if (activeView === 'prices') render();
+          else setView('prices');
         });
       }
     }
@@ -1738,6 +1842,7 @@ CONTROL_HTML = r"""<!doctype html>
     }
 
     function renderSavedSites() {
+      const selected = savedSiteSelect.value;
       savedSiteSelect.innerHTML = '<option value="">选择已保存站点</option>' + savedSites.map((site) => {
         const interval = site.interval_minutes ? ` · ${Math.round(site.interval_minutes / 60 * 100) / 100}h` : '';
         const next = site.next_run ? ` · 下次 ${formatDateTime(site.next_run)}` : '';
@@ -1761,6 +1866,8 @@ CONTROL_HTML = r"""<!doctype html>
         const label = `${name}${interval}${next}${status}${credential}`;
         return `<option value="${escapeHtml(site.site)}">${escapeHtml(label)}</option>`;
       }).join('');
+      if (savedSites.some((site) => site.site === selected)) savedSiteSelect.value = selected;
+      siteCountLabel.textContent = `${savedSites.length} 个已保存站点`;
     }
 
     function render() {
@@ -1778,6 +1885,9 @@ CONTROL_HTML = r"""<!doctype html>
       groupCount.textContent = String(groups.length);
       categoryCount.textContent = String(categories.size);
       rowCount.textContent = `${displayRows.length}/${rows.length} 行 · ${currentPage + 1}/${pageCount} 页`;
+      snapshotTime.textContent = latestGeneratedAt
+        ? `当前快照 ${formatDateTime(latestGeneratedAt)}`
+        : '尚未生成价格快照';
       exportCsvBtn.disabled = rows.length === 0;
       exportJsonBtn.disabled = rows.length === 0;
       renderCategoryStrip(displayRows);
@@ -2156,7 +2266,7 @@ CONTROL_HTML = r"""<!doctype html>
         stateRevision = Number(result.revision) || stateRevision;
         currentPage = 0;
         renderSavedSites();
-        render();
+        setView('prices');
         const errorOnly = rows.length > 0 && rows.every((row) => row.record_type === 'error');
         setState(errorOnly ? '未获取到价格' : '抓取完成');
         log(`认证方式：${result.tokenKey || 'cookie/session'}`);
@@ -2201,6 +2311,11 @@ CONTROL_HTML = r"""<!doctype html>
         }
       } else if (result.accepted) {
         updateAllBtn.disabled = true;
+        rows = [];
+        latestGeneratedAt = '';
+        currentPage = 0;
+        render();
+        snapshotTime.textContent = '正在重建当前价格快照';
         setState('后台更新中');
       }
       scheduleStatusPoll(250);
@@ -2297,7 +2412,7 @@ CONTROL_HTML = r"""<!doctype html>
       latestGeneratedAt = state.latest_generated_at || '';
       stateRevision = Number(state.revision) || 0;
       renderSavedSites();
-      render();
+      setView('prices');
       const currentSite = savedSites.find((item) => item.site === state.site);
       if (currentSite) {
         applySavedSite(currentSite);
@@ -2326,7 +2441,11 @@ CONTROL_HTML = r"""<!doctype html>
     savedSiteSelect.addEventListener('change', () => {
       const site = savedSites.find((item) => item.site === savedSiteSelect.value);
       applySavedSite(site);
+      if (site) setView('sites');
     });
+    for (const button of navItems) {
+      button.addEventListener('click', () => setView(button.dataset.view));
+    }
     filterInput.addEventListener('input', () => scheduleRender(true));
     siteFilterSelect.addEventListener('change', () => { currentPage = 0; render(); });
     typeFilterSelect.addEventListener('change', () => { currentPage = 0; render(); });
@@ -2355,7 +2474,10 @@ CONTROL_HTML = r"""<!doctype html>
     refreshLoginBtn.addEventListener('click', refreshLoginWebView);
     hideLoginBtn.addEventListener('click', hideLoginWebView);
     captureBtn.addEventListener('click', capture);
-    updateAllBtn.addEventListener('click', () => updateAllSaved('manual'));
+    updateAllBtn.addEventListener('click', () => {
+      setView('prices');
+      updateAllSaved('manual');
+    });
     exportCsvBtn.addEventListener('click', () => exportRows('csv'));
     exportJsonBtn.addEventListener('click', () => exportRows('json'));
     window.addEventListener('pywebviewready', init);
@@ -3452,7 +3574,7 @@ class PriceAppApi:
                 raise RuntimeError(f"{error_code.upper()}: {message}" if error_code else message)
             self.auto_login_attempts.pop(self.site, None)
             with self.data_lock:
-                merged_rows = merge_price_rows(load_latest_rows(), fresh_rows)
+                merged_rows = replace_price_rows(load_latest_rows(), fresh_rows, [self.site])
                 snapshot = write_price_snapshot(merged_rows, {
                     "site_count": 1,
                     "success_count": 1,
@@ -3812,7 +3934,8 @@ class PriceAppApi:
                 "reauth_count": len(reauth_sites),
                 "skipped_count": max(0, len(sites) - len(due_sites)),
             }
-            all_rows = merge_price_rows(load_latest_rows(), fresh_rows)
+            refreshed_sites = [record.get("site", "") for record in due_sites]
+            all_rows = replace_price_rows(load_latest_rows(), fresh_rows, refreshed_sites)
             snapshot = write_price_snapshot(all_rows, summary)
             self._cache_state(
                 rows=all_rows,
@@ -4415,9 +4538,9 @@ def main():
             APP_WINDOW_TITLE,
             html=CONTROL_HTML.replace("__APP_VERSION__", APP_VERSION),
             js_api=api,
-            width=980,
-            height=760,
-            min_size=(780, 560),
+            width=1180,
+            height=820,
+            min_size=(860, 620),
             text_select=True,
         )
         api.attach_controller_window(controller)
