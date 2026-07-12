@@ -8,6 +8,7 @@ import time
 import types
 import unittest
 from datetime import datetime, timezone
+from unittest import mock
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
@@ -22,6 +23,42 @@ class FakeWindow:
 
     def destroy(self):
         self.destroy_count += 1
+
+
+class FakeEvent:
+    def __init__(self, value=False):
+        self.value = value
+        self.handlers = []
+
+    def is_set(self):
+        return self.value
+
+    def __iadd__(self, handler):
+        self.handlers.append(handler)
+        return self
+
+
+class FakeBrowserWindow(FakeWindow):
+    def __init__(self, closed=False):
+        super().__init__()
+        self.events = types.SimpleNamespace(closed=FakeEvent(closed))
+        self.load_urls = []
+        self.show_count = 0
+        self.restore_count = 0
+        self.url_probe_count = 0
+
+    def get_current_url(self):
+        self.url_probe_count += 1
+        raise AssertionError("window health checks must not call get_current_url")
+
+    def load_url(self, url):
+        self.load_urls.append(url)
+
+    def show(self):
+        self.show_count += 1
+
+    def restore(self):
+        self.restore_count += 1
 
 
 class PriceAppLifecycleTests(unittest.TestCase):
@@ -154,6 +191,45 @@ class PriceAppLifecycleTests(unittest.TestCase):
             if thread.name.startswith("site-capture-")
         ]
         self.assertTrue(all(thread.daemon for thread in capture_threads))
+
+    def test_window_health_check_does_not_call_webview(self):
+        api = self.new_api()
+        window = FakeBrowserWindow()
+
+        self.assertTrue(api._window_alive(window))
+        self.assertEqual(window.url_probe_count, 0)
+
+        window.events.closed.value = True
+        self.assertFalse(api._window_alive(window))
+        self.assertEqual(window.url_probe_count, 0)
+
+    def test_relogin_recreates_closed_window_without_duplicate_navigation(self):
+        api = self.new_api()
+        api.browser_window = FakeBrowserWindow(closed=True)
+        created = FakeBrowserWindow()
+
+        with mock.patch.object(app.webview, "create_window", return_value=created) as create_window:
+            result = api._ensure_browser_window("https://example.com", visible=True)
+
+        self.assertIs(result, created)
+        create_window.assert_called_once()
+        self.assertEqual(created.load_urls, [])
+        self.assertEqual(created.show_count, 1)
+        self.assertEqual(created.restore_count, 1)
+
+    def test_relogin_does_not_wait_forever_for_window_lock(self):
+        api = self.new_api()
+        api.site = "https://old.example"
+        api.browser_lock.acquire()
+        try:
+            started = time.monotonic()
+            result = api.open_site("https://new.example")
+            self.assertLess(time.monotonic() - started, 1)
+            self.assertFalse(result["ok"])
+            self.assertIn("窗口正在切换", result["error"])
+            self.assertEqual(api.site, "https://old.example")
+        finally:
+            api.browser_lock.release()
 
     def test_interactive_capture_uses_a_daemon_job(self):
         api = self.new_api()

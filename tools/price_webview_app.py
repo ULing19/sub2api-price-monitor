@@ -71,7 +71,7 @@ OUTPUT_FIELDS = [
 
 
 APP_NAME = "Sub2APIPriceMonitor"
-APP_VERSION = "0.1.8"
+APP_VERSION = "0.1.9"
 APP_WINDOW_TITLE = "Sub2API 中转站比价"
 LOGGER = logging.getLogger(APP_NAME)
 SHUTDOWN_JOIN_TIMEOUT_SECONDS = 1.0
@@ -110,6 +110,7 @@ ERROR_ALREADY_EXISTS = 183
 APP_MUTEX_NAME = f"Local\\{APP_NAME}.SingleInstance"
 _APP_MUTEX_HANDLE = None
 MAX_SITE_WORKERS = 2
+WINDOW_LOCK_TIMEOUT_SECONDS = 0.5
 
 
 class AppShutdownRequested(RuntimeError):
@@ -1481,6 +1482,7 @@ CONTROL_HTML = r"""<!doctype html>
     let loginAutoCaptureTimer = null;
     let loginAutoCaptureBusy = false;
     let loginAutoCaptureMode = '';
+    let loginOpenBusy = false;
     let lastAutoCaptureError = '';
     let reauthQueue = [];
     let reauthActiveSite = '';
@@ -1898,6 +1900,34 @@ CONTROL_HTML = r"""<!doctype html>
         : record?.site || '未知站点';
     }
 
+    async function requestLoginWindow(site) {
+      if (loginOpenBusy) {
+        return { ok: false, busy: true, error: '登录窗口正在打开，请稍候。' };
+      }
+      loginOpenBusy = true;
+      openSiteBtn.disabled = true;
+      let timeoutId = null;
+      try {
+        const timeout = new Promise((resolve) => {
+          timeoutId = setTimeout(() => resolve({
+            ok: false,
+            timeout: true,
+            error: '打开登录窗口超时，请再次点击 WebView登录。',
+          }), 20000);
+        });
+        return await Promise.race([
+          window.pywebview.api.open_site(site),
+          timeout,
+        ]);
+      } catch (error) {
+        return { ok: false, error: String(error?.message || error || '打开登录窗口失败') };
+      } finally {
+        if (timeoutId) clearTimeout(timeoutId);
+        loginOpenBusy = false;
+        openSiteBtn.disabled = false;
+      }
+    }
+
     function finishActiveReauth() {
       if (!reauthActiveSite) return;
       const completed = reauthActiveSite;
@@ -1927,10 +1957,15 @@ CONTROL_HTML = r"""<!doctype html>
       savedSiteSelect.value = record.site;
       setState('需要重新授权');
       log(`正在打开重新授权窗口：${reauthLabel(record)}`);
-      const result = await window.pywebview.api.open_site(record.site);
+      const result = await requestLoginWindow(record.site);
       if (!result.ok) {
         log(`重新授权窗口打开失败：${result.error}`);
         reauthActiveSite = '';
+        if (result.timeout) {
+          reauthQueue.unshift(record);
+          setState('重新授权窗口超时');
+          return;
+        }
         setTimeout(startNextReauth, 500);
         return;
       }
@@ -1971,7 +2006,7 @@ CONTROL_HTML = r"""<!doctype html>
     }
 
     async function openSite() {
-      const result = await window.pywebview.api.open_site(siteInput.value);
+      const result = await requestLoginWindow(siteInput.value);
       if (!result.ok) {
         log(result.error);
         return;
@@ -2452,10 +2487,10 @@ class PriceAppApi:
         if not window:
             return False
         try:
-            window.get_current_url()
-            return True
+            closed_event = getattr(getattr(window, "events", None), "closed", None)
+            return not (closed_event and closed_event.is_set())
         except Exception:
-            return False
+            return True
 
     def _browser_alive(self):
         if self._window_alive(self.browser_window):
@@ -2471,7 +2506,10 @@ class PriceAppApi:
 
     def _ensure_browser_window(self, url=None, visible=False):
         self._raise_if_shutting_down()
-        with self.browser_lock:
+        if not self.browser_lock.acquire(timeout=WINDOW_LOCK_TIMEOUT_SECONDS):
+            raise RuntimeError("WebView 窗口正在切换，请稍后重试")
+        created = False
+        try:
             self._raise_if_shutting_down()
             if not self._browser_alive():
                 self.browser_cancel_event.clear()
@@ -2493,8 +2531,13 @@ class PriceAppApi:
                     finally:
                         self._raise_if_shutting_down()
                 self.attach_browser_window(created_window)
+                created = True
             window = self.browser_window
-            if url:
+        finally:
+            self.browser_lock.release()
+
+        try:
+            if url and not created:
                 self.browser_cancel_event.clear()
                 self.browser_operation_id += 1
                 window.load_url(url)
@@ -2509,6 +2552,11 @@ class PriceAppApi:
                 except Exception:
                     pass
             return window
+        except Exception:
+            if window is self.browser_window:
+                self.browser_cancel_event.set()
+                self.browser_window = None
+            raise
 
     def _ensure_worker_window(self, slot, url=None):
         self._raise_if_shutting_down()
@@ -2729,10 +2777,11 @@ class PriceAppApi:
             return {"ok": False, "busy": True, "error": "登录窗口正在抓取，请稍后再试"}
         try:
             self._raise_if_shutting_down()
-            self.site = normalize_site(site)
-            self._ensure_browser_window(self.site, visible=True)
-            self._start_credential_helper(self.site)
-            return {"ok": True, "site": self.site}
+            normalized = normalize_site(site)
+            self._ensure_browser_window(normalized, visible=True)
+            self.site = normalized
+            self._start_credential_helper(normalized)
+            return {"ok": True, "site": normalized}
         except Exception as exc:
             error = str(exc)
             failure = self._classify_capture_failure(error, self.browser_window)
