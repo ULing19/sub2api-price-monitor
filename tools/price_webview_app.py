@@ -88,7 +88,7 @@ OUTPUT_FIELDS = [
 
 
 APP_NAME = "Sub2APIPriceMonitor"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.2.1"
 APP_WINDOW_TITLE = "Sub2API 中转站比价"
 LOGGER = logging.getLogger(APP_NAME)
 SHUTDOWN_JOIN_TIMEOUT_SECONDS = 3.0
@@ -2452,6 +2452,8 @@ CONTROL_HTML = r"""<!doctype html>
       text-align: center;
     }
     .site-picker { display: grid; gap: 8px; }
+    .site-picker-row { display: grid; grid-template-columns: minmax(0, 1fr) 34px; gap: 6px; }
+    .site-picker-add { width: 34px; height: 36px; padding: 0; font-size: 20px; line-height: 1; }
     .site-count { color: var(--muted); font-size: 11px; }
     .side-spacer { flex: 1; }
     .side-status {
@@ -2535,6 +2537,7 @@ CONTROL_HTML = r"""<!doctype html>
     .section-head { display: flex; align-items: flex-end; justify-content: space-between; gap: 14px; margin-bottom: 16px; }
     .section-head h2 { margin: 0; font-size: 18px; }
     .section-head p { margin: 5px 0 0; color: var(--muted); font-size: 12px; }
+    .section-head-actions { display: flex; align-items: center; gap: 8px; }
     .settings-layout { display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(270px, 0.75fr); gap: 14px; align-items: start; }
     .health-summary { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 9px; margin-bottom: 12px; }
     .site-monitor-toolbar { display: grid; grid-template-columns: minmax(180px, 1fr) minmax(140px, 0.35fr) minmax(140px, 0.35fr); gap: 9px; margin-bottom: 10px; }
@@ -2758,7 +2761,7 @@ CONTROL_HTML = r"""<!doctype html>
         <div class="side-label">工作区</div>
         <nav class="side-nav" aria-label="工作区导航">
           <button class="nav-item active" type="button" data-view="prices"><span class="nav-icon">¥</span>当前价格</button>
-          <button class="nav-item" type="button" data-view="sites"><span class="nav-icon">S</span>站点监控</button>
+          <button class="nav-item" type="button" data-view="sites"><span class="nav-icon">S</span>站点管理</button>
           <button class="nav-item" type="button" data-view="changes"><span class="nav-icon">Δ</span>变化记录<span class="nav-count" id="changeCountBadge" hidden>0</span></button>
           <button class="nav-item" type="button" data-view="notifications"><span class="nav-icon">@</span>SMTP 通知</button>
           <button class="nav-item" type="button" data-view="logs"><span class="nav-icon">›_</span>运行日志</button>
@@ -2767,7 +2770,10 @@ CONTROL_HTML = r"""<!doctype html>
 
       <div class="site-picker">
         <div class="side-label">当前站点</div>
-        <select id="savedSiteSelect" aria-label="选择已保存站点"></select>
+        <div class="site-picker-row">
+          <select id="savedSiteSelect" aria-label="选择已保存站点"></select>
+          <button class="site-picker-add" id="quickAddSiteBtn" type="button" title="新增站点" aria-label="新增站点">+</button>
+        </div>
         <span class="site-count" id="siteCountLabel">0 个已保存站点</span>
       </div>
 
@@ -2864,9 +2870,10 @@ CONTROL_HTML = r"""<!doctype html>
         <section class="view site-view" id="sitesView" hidden>
           <div class="section-head">
             <div>
-              <h2>站点监控</h2>
+              <h2>站点管理</h2>
               <p>查看健康状态、监控开关和最近检查结果。</p>
             </div>
+            <div class="section-head-actions"><button id="addSiteBtn" class="primary" type="button">+ 新增站点</button></div>
           </div>
 
           <div class="health-summary">
@@ -2907,7 +2914,7 @@ CONTROL_HTML = r"""<!doctype html>
             <div class="site-recent-changes" id="siteRecentChecks"></div>
           </section>
 
-          <div class="settings-layout">
+          <div class="settings-layout" id="siteSettingsLayout">
             <section class="tool-panel">
               <h3>站点配置</h3>
               <div class="settings-grid">
@@ -2939,14 +2946,14 @@ CONTROL_HTML = r"""<!doctype html>
                 <label class="toggle"><input id="autoLoginInput" type="checkbox" checked />允许自动填写与登录</label>
               </div>
               <div class="action-grid">
-                <button id="saveSiteBtn" type="button">保存站点</button>
-                <button id="clearCredentialsBtn" type="button">清除密码</button>
+                <button id="saveSiteBtn" type="button">添加站点</button>
+                <button id="clearCredentialsBtn" type="button" disabled>清除密码</button>
                 <button id="testConnectionBtn" type="button">测试连接</button>
                 <button id="openSiteBtn" type="button" class="wide">打开 WebView 登录</button>
                 <button id="refreshLoginBtn" type="button">手动刷新验证页</button>
                 <button id="hideLoginBtn" type="button">暂时跳过本站</button>
                 <button id="captureBtn" type="button" class="primary wide">抓取当前价格</button>
-                <button id="deleteSiteBtn" type="button" class="danger wide">删除站点</button>
+                <button id="deleteSiteBtn" type="button" class="danger wide" disabled>删除站点</button>
               </div>
               <div class="connection-test-result" id="connectionTestResult" hidden></div>
             </section>
@@ -3093,6 +3100,9 @@ CONTROL_HTML = r"""<!doctype html>
     const hideLoginBtn = document.querySelector('#hideLoginBtn');
     const captureBtn = document.querySelector('#captureBtn');
     const saveSiteBtn = document.querySelector('#saveSiteBtn');
+    const addSiteBtn = document.querySelector('#addSiteBtn');
+    const quickAddSiteBtn = document.querySelector('#quickAddSiteBtn');
+    const siteSettingsLayout = document.querySelector('#siteSettingsLayout');
     const deleteSiteBtn = document.querySelector('#deleteSiteBtn');
     const clearCredentialsBtn = document.querySelector('#clearCredentialsBtn');
     const updateAllBtn = document.querySelector('#updateAllBtn');
@@ -3271,7 +3281,7 @@ CONTROL_HTML = r"""<!doctype html>
 
     function setView(view) {
       const views = { prices: pricesView, sites: sitesView, changes: changesView, notifications: notificationsView, logs: logsView };
-      const titles = { prices: '当前价格', sites: '站点监控', changes: '变化记录', notifications: 'SMTP 通知', logs: '运行日志' };
+      const titles = { prices: '当前价格', sites: '站点管理', changes: '变化记录', notifications: 'SMTP 通知', logs: '运行日志' };
       activeView = views[view] ? view : 'prices';
       for (const [name, element] of Object.entries(views)) {
         element.hidden = name !== activeView;
@@ -3524,6 +3534,7 @@ CONTROL_HTML = r"""<!doctype html>
       }).join('');
       if (savedSites.some((site) => site.site === selected)) savedSiteSelect.value = selected;
       siteCountLabel.textContent = `${savedSites.length} 个已保存站点`;
+      updateSiteFormMode();
       renderSiteMonitor();
     }
 
@@ -4087,6 +4098,41 @@ CONTROL_HTML = r"""<!doctype html>
       includeGroupsInput.checked = site.include_groups !== false;
       rememberCredentialsInput.checked = site.remember_credentials !== false;
       autoLoginInput.checked = site.auto_login !== false && rememberCredentialsInput.checked;
+      updateSiteFormMode();
+    }
+
+    function updateSiteFormMode() {
+      const editing = Boolean(
+        savedSiteSelect.value
+        && savedSites.some((item) => item.site === savedSiteSelect.value)
+      );
+      saveSiteBtn.textContent = editing ? '保存修改' : '添加站点';
+      deleteSiteBtn.disabled = !editing;
+      clearCredentialsBtn.disabled = !editing;
+    }
+
+    function prepareNewSite(scrollToForm = true) {
+      savedSiteSelect.value = '';
+      siteInput.value = '';
+      siteNameInput.value = '';
+      apiBaseInput.value = '/api/v1';
+      intervalHoursInput.value = '3';
+      autoRefreshInput.checked = true;
+      includeGroupsInput.checked = true;
+      rememberCredentialsInput.checked = true;
+      autoLoginInput.checked = true;
+      lastAutoNote = '';
+      noteTouched = false;
+      connectionTestResult.hidden = true;
+      renderSiteDetail();
+      updateSiteFormMode();
+      setView('sites');
+      if (scrollToForm) {
+        requestAnimationFrame(() => {
+          siteSettingsLayout.scrollIntoView({ behavior: 'smooth', block: 'start' });
+          siteInput.focus();
+        });
+      }
     }
 
     function syncDefaultNote(force = false) {
@@ -4159,6 +4205,7 @@ CONTROL_HTML = r"""<!doctype html>
       savedSiteSelect.value = '';
       siteInput.value = '';
       siteNameInput.value = '';
+      updateSiteFormMode();
       render();
       renderChanges();
       log(result.credentials_deleted
@@ -4662,8 +4709,8 @@ CONTROL_HTML = r"""<!doctype html>
       setView('prices');
       const currentSite = savedSites.find((item) => item.site === state.site);
       if (currentSite) {
-        applySavedSite(currentSite);
         savedSiteSelect.value = currentSite.site;
+        applySavedSite(currentSite);
       } else if (siteInput.value) {
         syncDefaultNote(true);
       }
@@ -4704,6 +4751,7 @@ CONTROL_HTML = r"""<!doctype html>
       if (savedSiteSelect.value && siteInput.value.trim() !== savedSiteSelect.value) {
         savedSiteSelect.value = '';
         renderSiteDetail();
+        updateSiteFormMode();
       }
       syncDefaultNote();
     });
@@ -4712,9 +4760,13 @@ CONTROL_HTML = r"""<!doctype html>
     });
     savedSiteSelect.addEventListener('change', () => {
       const site = savedSites.find((item) => item.site === savedSiteSelect.value);
-      applySavedSite(site);
-      if (site) setView('sites');
-      renderSiteDetail();
+      if (site) {
+        applySavedSite(site);
+        setView('sites');
+        renderSiteDetail();
+      } else {
+        prepareNewSite(false);
+      }
     });
     for (const button of navItems) {
       button.addEventListener('click', () => setView(button.dataset.view));
@@ -4760,6 +4812,8 @@ CONTROL_HTML = r"""<!doctype html>
       if (autoLoginInput.checked) rememberCredentialsInput.checked = true;
     });
     saveSiteBtn.addEventListener('click', saveSite);
+    addSiteBtn.addEventListener('click', () => prepareNewSite(true));
+    quickAddSiteBtn.addEventListener('click', () => prepareNewSite(true));
     deleteSiteBtn.addEventListener('click', deleteSite);
     clearCredentialsBtn.addEventListener('click', clearCredentials);
     testConnectionBtn.addEventListener('click', testSiteConnection);

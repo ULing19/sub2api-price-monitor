@@ -52,7 +52,7 @@
 
 <img src="docs/images/sub2api-overview.png" alt="Sub2API 中转站比价总览" width="920">
 
-主界面采用左侧工作区导航，当前价格、站点监控、变化记录、SMTP 通知和运行日志各自独立。顶部可直接切换 `OpenAI`、`Anthropic`、`Gemini`、`Grok`，统计区展示当前快照中的套餐、分组和模型分类数量。`全部` 页按价格升序展示，模型分类页按倍率升序展示。
+主界面采用左侧工作区导航，当前价格、站点管理、变化记录、SMTP 通知和运行日志各自独立。顶部可直接切换 `OpenAI`、`Anthropic`、`Gemini`、`Grok`，统计区展示当前快照中的套餐、分组和模型分类数量。`全部` 页按价格升序展示，模型分类页按倍率升序展示。
 
 ### 2. 价格变化与未读状态
 
@@ -64,7 +64,7 @@
 
 <img src="docs/images/sub2api-webview-login.png" alt="WebView 登录后自动抓取价格" width="920">
 
-在 `站点监控` 页面保存网址、备注、API 路径、更新间隔、分组倍率和自动检查开关，再点击 `打开 WebView 登录`。你可以在站点窗口里正常登录、完成安全验证或进入控制台；软件不绕过验证，只复用已经登录成功的 WebView Cookie/session。登录态可用后，软件会自动调用 Sub2API 接口抓取当前价格，并把 WebView 窗口收起。
+点击左侧当前站点旁的 `+`，或进入 `站点管理` 后点击 `新增站点`，填写网址、备注、API 路径、更新间隔、分组倍率和自动检查开关，再点击 `打开 WebView 登录`。你可以在站点窗口里正常登录、完成安全验证或进入控制台；软件不绕过验证，只复用已经登录成功的 WebView Cookie/session。登录态可用后，软件会自动调用 Sub2API 接口抓取当前价格，并把 WebView 窗口收起。
 
 关闭 `自动检查此站点` 后，软件启动时的自动抓取和后台定时检查会跳过该站点，但不会禁用人工操作。你仍可在站点页执行 WebView 抓取，也可点击 `更新全部` 临时刷新包括已关闭自动检查在内的所有保存站点。
 
@@ -192,7 +192,7 @@ Windows 凭据管理器中的站点密码和 SMTP 密码属于当前 Windows 用
 生成单文件 exe：
 
 ```powershell
-.\tools\packaging\build_price_app.ps1 -Version 1.2.0
+.\tools\packaging\build_price_app.ps1 -Version 1.2.1
 ```
 
 产物位置：

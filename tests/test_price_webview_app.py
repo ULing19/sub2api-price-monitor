@@ -2562,6 +2562,10 @@ class PriceAppLifecycleTests(unittest.TestCase):
 
         self.assertIn("autoRefreshInput.checked", save_site_block)
         self.assertIn("state.changes", init_block)
+        self.assertLess(
+            init_block.index("savedSiteSelect.value = currentSite.site"),
+            init_block.index("applySavedSite(currentSite)"),
+        )
         self.assertIn("result.changes", runtime_block)
         self.assertIn("window.pywebview.api.acknowledge_changes", html)
         self.assertIn("const hasPercent = item.change_percent !== null", render_changes_block)
@@ -2644,6 +2648,7 @@ process.stdout.write(JSON.stringify({{ stale, current, newer, stateRevision, sch
             check=True,
             capture_output=True,
             text=True,
+            encoding="utf-8",
         )
         result = json.loads(completed.stdout)
         self.assertFalse(result["stale"])
@@ -2651,6 +2656,88 @@ process.stdout.write(JSON.stringify({{ stale, current, newer, stateRevision, sch
         self.assertTrue(result["newer"])
         self.assertEqual(result["stateRevision"], 8)
         self.assertEqual(result["scheduled"], [0])
+
+    def test_add_site_entry_resets_and_focuses_the_site_form(self):
+        html = app.CONTROL_HTML
+        self.assertIn('id="quickAddSiteBtn"', html)
+        self.assertIn('id="addSiteBtn"', html)
+        self.assertIn("quickAddSiteBtn.addEventListener('click', () => prepareNewSite(true))", html)
+        self.assertIn("addSiteBtn.addEventListener('click', () => prepareNewSite(true))", html)
+        helper_block = html.split("function updateSiteFormMode()", 1)[1].split(
+            "function syncDefaultNote",
+            1,
+        )[0]
+        script = f"""
+let savedSites = [{{ site: 'https://existing.example' }}];
+const savedSiteSelect = {{ value: 'https://existing.example' }};
+const siteInput = {{ value: 'old', focused: false, focus() {{ this.focused = true; }} }};
+const siteNameInput = {{ value: 'old name' }};
+const apiBaseInput = {{ value: '/old' }};
+const intervalHoursInput = {{ value: '9' }};
+const autoRefreshInput = {{ checked: false }};
+const includeGroupsInput = {{ checked: false }};
+const rememberCredentialsInput = {{ checked: false }};
+const autoLoginInput = {{ checked: false }};
+const connectionTestResult = {{ hidden: false }};
+const saveSiteBtn = {{ textContent: '' }};
+const deleteSiteBtn = {{ disabled: false }};
+const clearCredentialsBtn = {{ disabled: false }};
+const siteSettingsLayout = {{ scrolled: false, scrollIntoView() {{ this.scrolled = true; }} }};
+let lastAutoNote = 'old';
+let noteTouched = true;
+let selectedView = '';
+let detailRenders = 0;
+function renderSiteDetail() {{ detailRenders += 1; }}
+function setView(view) {{ selectedView = view; }}
+function requestAnimationFrame(callback) {{ callback(); }}
+function updateSiteFormMode(){helper_block}
+prepareNewSite(true);
+const addState = {{
+  selected: savedSiteSelect.value,
+  site: siteInput.value,
+  apiBase: apiBaseInput.value,
+  interval: intervalHoursInput.value,
+  enabled: autoRefreshInput.checked && includeGroupsInput.checked
+    && rememberCredentialsInput.checked && autoLoginInput.checked,
+  saveLabel: saveSiteBtn.textContent,
+  deleteDisabled: deleteSiteBtn.disabled,
+  clearDisabled: clearCredentialsBtn.disabled,
+  selectedView,
+  focused: siteInput.focused,
+  scrolled: siteSettingsLayout.scrolled,
+}};
+savedSiteSelect.value = 'https://existing.example';
+updateSiteFormMode();
+const editState = {{
+  saveLabel: saveSiteBtn.textContent,
+  deleteDisabled: deleteSiteBtn.disabled,
+  clearDisabled: clearCredentialsBtn.disabled,
+}};
+process.stdout.write(JSON.stringify({{ addState, editState, detailRenders }}));
+"""
+        completed = subprocess.run(
+            ["node", "-e", script],
+            check=True,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+        )
+        result = json.loads(completed.stdout)
+        self.assertEqual(result["addState"]["selected"], "")
+        self.assertEqual(result["addState"]["site"], "")
+        self.assertEqual(result["addState"]["apiBase"], "/api/v1")
+        self.assertEqual(result["addState"]["interval"], "3")
+        self.assertTrue(result["addState"]["enabled"])
+        self.assertEqual(result["addState"]["saveLabel"], "添加站点")
+        self.assertTrue(result["addState"]["deleteDisabled"])
+        self.assertTrue(result["addState"]["clearDisabled"])
+        self.assertEqual(result["addState"]["selectedView"], "sites")
+        self.assertTrue(result["addState"]["focused"])
+        self.assertTrue(result["addState"]["scrolled"])
+        self.assertEqual(result["editState"]["saveLabel"], "保存修改")
+        self.assertFalse(result["editState"]["deleteDisabled"])
+        self.assertFalse(result["editState"]["clearDisabled"])
+        self.assertEqual(result["detailRenders"], 1)
 
     def test_reauth_queue_reconciles_an_active_site_no_longer_required(self):
         html = app.CONTROL_HTML
