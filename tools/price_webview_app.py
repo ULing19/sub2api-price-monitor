@@ -3,6 +3,7 @@ import argparse
 import ctypes
 import csv
 import hashlib
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import io
 import json
 import logging
@@ -12,13 +13,17 @@ import pathlib
 import queue
 import random
 import re
+import secrets
+import socket
 import subprocess
 import sys
 import threading
 import time
 from ctypes import wintypes
 from datetime import datetime, timedelta, timezone
+from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse, urlunparse
+from urllib.request import Request, urlopen
 
 import psutil
 import webview
@@ -71,7 +76,7 @@ OUTPUT_FIELDS = [
 
 
 APP_NAME = "Sub2APIPriceMonitor"
-APP_VERSION = "0.1.11"
+APP_VERSION = "0.1.12"
 APP_WINDOW_TITLE = "Sub2API 中转站比价"
 LOGGER = logging.getLogger(APP_NAME)
 SHUTDOWN_JOIN_TIMEOUT_SECONDS = 1.0
@@ -109,10 +114,12 @@ ERROR_NOT_FOUND = 1168
 ERROR_ALREADY_EXISTS = 183
 APP_MUTEX_NAME = f"Local\\{APP_NAME}.SingleInstance"
 _APP_MUTEX_HANDLE = None
-MAX_SITE_WORKERS = 2
+MAX_SITE_WORKERS = 1
 WINDOW_LOCK_TIMEOUT_SECONDS = 0.5
 WINDOW_INITIALIZE_TIMEOUT_SECONDS = 15
 INTERACTIVE_RELOGIN_WAIT_SECONDS = 5
+BROWSER_HOST_START_TIMEOUT_SECONDS = 30
+BROWSER_IPC_TIMEOUT_SECONDS = 12
 
 
 class AppShutdownRequested(RuntimeError):
@@ -2335,6 +2342,416 @@ class BrowserCredentialBridge:
         return self.api.save_browser_credentials(username, password)
 
 
+class RemoteWindowEvent:
+    def __init__(self, manager=None, initialized=False):
+        self.manager = manager
+        self.initialized = initialized
+
+    def is_set(self):
+        return False
+
+    def wait(self, timeout=None):
+        if not self.initialized:
+            return False
+        try:
+            self.manager.ensure_started(timeout=timeout)
+            return True
+        except Exception:
+            return False
+
+    def __iadd__(self, handler):
+        return self
+
+
+class RemoteWindow:
+    def __init__(self, manager, name):
+        self.manager = manager
+        self.name = name
+        self.events = type("RemoteWindowEvents", (), {
+            "initialized": RemoteWindowEvent(manager, initialized=True),
+            "closing": RemoteWindowEvent(),
+            "closed": RemoteWindowEvent(),
+        })()
+
+    def load_url(self, url):
+        self.manager.call("load_url", self.name, {"url": url})
+
+    def get_current_url(self):
+        return self.manager.call("get_current_url", self.name) or ""
+
+    def evaluate_js(self, script, callback=None):
+        if callback is None:
+            return self.manager.call(
+                "evaluate_js",
+                self.name,
+                {"script": script, "timeout": BROWSER_IPC_TIMEOUT_SECONDS},
+                timeout=BROWSER_IPC_TIMEOUT_SECONDS + 3,
+            )
+
+        def invoke():
+            try:
+                result = self.manager.call(
+                    "evaluate_js",
+                    self.name,
+                    {"script": script, "timeout": 65},
+                    timeout=70,
+                )
+            except Exception as exc:
+                result = {"message": str(exc), "error_code": "webview_host_error"}
+            callback(result)
+
+        threading.Thread(
+            target=invoke,
+            name=f"remote-js-{self.name}",
+            daemon=True,
+        ).start()
+        return True
+
+    def show(self):
+        self.manager.call("show", self.name)
+
+    def restore(self):
+        self.manager.call("restore", self.name)
+
+    def hide(self):
+        self.manager.call("hide", self.name)
+
+    def destroy(self):
+        return None
+
+
+class BrowserProcessManager:
+    def __init__(self, storage_path):
+        self.storage_path = pathlib.Path(storage_path)
+        self.token = secrets.token_urlsafe(32)
+        self.port = self._free_port()
+        self.process = None
+        self.ready_pid = None
+        self.lock = threading.RLock()
+        self.generation = 0
+
+    @staticmethod
+    def _free_port():
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.bind(("127.0.0.1", 0))
+            return sock.getsockname()[1]
+
+    def window(self, name):
+        return RemoteWindow(self, name)
+
+    def _command(self):
+        executable = pathlib.Path(sys.executable)
+        command = [str(executable)]
+        if not getattr(sys, "frozen", False):
+            command.append(str(pathlib.Path(__file__).resolve()))
+        command.extend([
+            "--browser-host",
+            "--browser-host-port", str(self.port),
+            "--browser-host-token", self.token,
+            "--browser-host-storage", str(self.storage_path),
+        ])
+        return command
+
+    def ensure_started(self, timeout=None):
+        timeout = BROWSER_HOST_START_TIMEOUT_SECONDS if timeout is None else float(timeout)
+        with self.lock:
+            if self.process and self.process.poll() is None:
+                if self.ready_pid == self.process.pid:
+                    return
+            else:
+                self._terminate_locked()
+                self.storage_path.mkdir(parents=True, exist_ok=True)
+                creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0
+                self.process = subprocess.Popen(
+                    self._command(),
+                    stdin=subprocess.DEVNULL,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    creationflags=creationflags,
+                )
+                self.ready_pid = None
+                self.generation += 1
+                LOGGER.info("Started isolated WebView host generation=%s pid=%s", self.generation, self.process.pid)
+            process = self.process
+
+        deadline = time.monotonic() + max(1.0, timeout)
+        last_error = ""
+        while time.monotonic() < deadline:
+            if process.poll() is not None:
+                raise RuntimeError(f"WebView 子进程启动失败，退出码 {process.returncode}")
+            try:
+                self._request({"command": "ping"}, timeout=1)
+                with self.lock:
+                    if self.process is process and process.poll() is None:
+                        self.ready_pid = process.pid
+                return
+            except Exception as exc:
+                last_error = str(exc)
+                time.sleep(0.2)
+        self.mark_failed("startup_timeout")
+        raise RuntimeError(f"WebView 子进程启动超时：{last_error}")
+
+    def call(self, command, window=None, payload=None, timeout=BROWSER_IPC_TIMEOUT_SECONDS):
+        self.ensure_started()
+        request_payload = {
+            "command": command,
+            "window": window or "",
+            "payload": payload or {},
+        }
+        started = time.monotonic()
+        try:
+            result = self._request(request_payload, timeout=timeout)
+            LOGGER.debug(
+                "WebView IPC command=%s window=%s duration=%.3f",
+                command,
+                window or "",
+                time.monotonic() - started,
+            )
+            return result
+        except Exception as exc:
+            LOGGER.warning(
+                "WebView IPC failed command=%s window=%s duration=%.3f error=%s",
+                command,
+                window or "",
+                time.monotonic() - started,
+                exc,
+            )
+            self.mark_failed(f"{command}_failed")
+            raise RuntimeError(f"WebView 子进程无响应，已自动重启：{exc}") from exc
+
+    def _request(self, payload, timeout):
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+        request = Request(
+            f"http://127.0.0.1:{self.port}/command",
+            data=body,
+            headers={
+                "Content-Type": "application/json",
+                "X-Sub2API-Token": self.token,
+            },
+            method="POST",
+        )
+        try:
+            with urlopen(request, timeout=max(0.2, float(timeout))) as response:
+                result = json.loads(response.read().decode("utf-8"))
+        except (HTTPError, URLError, TimeoutError, OSError, ValueError) as exc:
+            raise RuntimeError(str(exc)) from exc
+        if not result.get("ok"):
+            raise RuntimeError(result.get("error") or "WebView 子进程调用失败")
+        return result.get("result")
+
+    def mark_failed(self, reason):
+        with self.lock:
+            LOGGER.warning("Recycling isolated WebView host: %s", reason)
+            self._terminate_locked()
+
+    def _terminate_locked(self):
+        process = self.process
+        self.process = None
+        self.ready_pid = None
+        if not process:
+            return
+        try:
+            parent = psutil.Process(process.pid)
+            owned = parent.children(recursive=True)
+            for child in reversed(owned):
+                try:
+                    child.terminate()
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+            try:
+                parent.terminate()
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+            _, alive = psutil.wait_procs([*owned, parent], timeout=2)
+            for item in alive:
+                try:
+                    item.kill()
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+        except psutil.NoSuchProcess:
+            pass
+
+    def shutdown(self):
+        with self.lock:
+            if self.process and self.process.poll() is None:
+                try:
+                    self._request({"command": "shutdown"}, timeout=2)
+                except Exception:
+                    pass
+            self._terminate_locked()
+
+
+class BrowserHostCredentialBridge:
+    def __init__(self):
+        self.site = ""
+
+    def save_credentials(self, username="", password=""):
+        try:
+            if not self.site:
+                return {"ok": False, "error": "当前没有选择站点"}
+            write_site_credentials(self.site, username, password)
+            return {"ok": True, "site": self.site}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+
+class BrowserHostRuntime:
+    def __init__(self, port, token, storage_path):
+        self.port = int(port)
+        self.token = token
+        self.storage_path = pathlib.Path(storage_path)
+        self.credential_bridge = BrowserHostCredentialBridge()
+        self.windows = {}
+        self.server = None
+        self.shutting_down = threading.Event()
+        self.login_cancelled = threading.Event()
+
+    def attach_windows(self, login, workers):
+        self.windows["login"] = login
+        for slot, worker in enumerate(workers):
+            self.windows[f"worker-{slot}"] = worker
+        login.events.closing += self._on_login_closing
+
+    def _on_login_closing(self, window=None):
+        if self.shutting_down.is_set():
+            return None
+        self.login_cancelled.set()
+        threading.Thread(target=self.windows["login"].hide, daemon=True).start()
+        return False
+
+    def execute(self, request):
+        command = request.get("command")
+        if command == "ping":
+            return {"version": APP_VERSION}
+        if command == "shutdown":
+            threading.Thread(target=self.stop, daemon=True).start()
+            return True
+        name = request.get("window") or ""
+        window = self.windows.get(name)
+        if not window:
+            raise RuntimeError(f"未知 WebView 窗口：{name}")
+        payload = request.get("payload") or {}
+        if command == "load_url":
+            url = str(payload.get("url") or BLANK_PAGE)
+            if name == "login":
+                self.credential_bridge.site = normalize_site(url) if url != BLANK_PAGE else ""
+                self.login_cancelled.clear()
+            window.load_url(url)
+            return True
+        if command == "get_current_url":
+            return window.get_current_url() or ""
+        if command == "show":
+            window.show()
+            return True
+        if command == "restore":
+            window.restore()
+            return True
+        if command == "hide":
+            if name == "login":
+                self.login_cancelled.set()
+            window.hide()
+            return True
+        if command == "evaluate_js":
+            script = str(payload.get("script") or "")
+            timeout = max(1.0, float(payload.get("timeout") or BROWSER_IPC_TIMEOUT_SECONDS))
+            done = threading.Event()
+            holder = {}
+
+            def callback(result):
+                holder["result"] = result
+                done.set()
+
+            immediate = window.evaluate_js(script, callback=callback)
+            if immediate not in (True, "true", None):
+                return immediate
+            if not done.wait(timeout):
+                raise TimeoutError("WebView JavaScript 执行超时")
+            return holder.get("result")
+        raise RuntimeError(f"未知 WebView 命令：{command}")
+
+    def serve(self):
+        runtime = self
+
+        class Handler(BaseHTTPRequestHandler):
+            def do_POST(self):
+                if self.path != "/command" or self.headers.get("X-Sub2API-Token") != runtime.token:
+                    self.send_error(403)
+                    return
+                try:
+                    length = int(self.headers.get("Content-Length") or 0)
+                    request = json.loads(self.rfile.read(length).decode("utf-8"))
+                    response = {"ok": True, "result": runtime.execute(request)}
+                except Exception as exc:
+                    response = {"ok": False, "error": str(exc)}
+                body = json.dumps(response, ensure_ascii=False).encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json; charset=utf-8")
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+            def log_message(self, format, *args):
+                return
+
+        class Server(ThreadingHTTPServer):
+            daemon_threads = True
+
+        self.server = Server(("127.0.0.1", self.port), Handler)
+        self.server.serve_forever(poll_interval=0.2)
+
+    def stop(self):
+        if self.shutting_down.is_set():
+            return
+        self.shutting_down.set()
+        if self.server:
+            self.server.shutdown()
+        for window in list(self.windows.values()):
+            try:
+                window.destroy()
+            except Exception:
+                pass
+
+
+def run_browser_host(args):
+    runtime = BrowserHostRuntime(
+        args.browser_host_port,
+        args.browser_host_token,
+        args.browser_host_storage,
+    )
+    login = webview.create_window(
+        "目标站点 WebView 登录",
+        url=BLANK_PAGE,
+        js_api=runtime.credential_bridge,
+        width=1120,
+        height=820,
+        min_size=(760, 520),
+        hidden=True,
+        focus=False,
+        text_select=True,
+    )
+    workers = [
+        webview.create_window(
+            f"后台价格抓取 {slot + 1}",
+            url=BLANK_PAGE,
+            width=960,
+            height=720,
+            min_size=(640, 480),
+            hidden=True,
+            focus=False,
+            text_select=False,
+        )
+        for slot in range(MAX_SITE_WORKERS)
+    ]
+    runtime.attach_windows(login, workers)
+    webview.start(
+        runtime.serve,
+        gui="edgechromium",
+        private_mode=False,
+        storage_path=str(runtime.storage_path),
+    )
+    return 0
+
+
 class PriceAppApi:
     def __init__(self, site=""):
         self.site = normalize_site(site) if str(site or "").strip() else ""
@@ -2591,6 +3008,11 @@ class PriceAppApi:
             if url:
                 self.browser_cancel_event.clear()
                 self.browser_operation_id += 1
+                LOGGER.info(
+                    "Login WebView navigation operation=%s host=%s",
+                    self.browser_operation_id,
+                    urlparse(url).netloc,
+                )
                 window.load_url(url)
                 self._raise_if_shutting_down()
             if visible:
@@ -2623,6 +3045,7 @@ class PriceAppApi:
         self._wait_window_initialized(window)
         try:
             if url:
+                LOGGER.info("Worker WebView navigation slot=%s host=%s", slot + 1, urlparse(url).netloc)
                 window.load_url(url)
                 self._raise_if_shutting_down()
             return window
@@ -3354,6 +3777,7 @@ class PriceAppApi:
         self._raise_if_shutting_down()
         site = normalize_site(record.get("site", ""))
         base = self._normalized_api_base(record.get("api_base", API_BASE))
+        LOGGER.info("Site capture start slot=%s host=%s", worker_slot + 1, urlparse(site).netloc)
         with self.worker_operation_locks[worker_slot]:
             window = None
             try:
@@ -3382,12 +3806,19 @@ class PriceAppApi:
                     raise RuntimeError(f"{error_code.upper()}: {message}" if error_code else message)
                 self.auto_login_attempts.pop(site, None)
                 result["ok"] = True
+                LOGGER.info("Site capture completed slot=%s host=%s", worker_slot + 1, urlparse(site).netloc)
                 return result
             except AppShutdownRequested:
                 raise
             except Exception as exc:
                 now = datetime.now(timezone.utc).isoformat()
                 error = str(exc)
+                LOGGER.warning(
+                    "Site capture failed slot=%s host=%s error=%s",
+                    worker_slot + 1,
+                    urlparse(site).netloc,
+                    error,
+                )
                 failure = self._classify_capture_failure(error, window)
                 return {
                     "ok": False,
@@ -3679,6 +4110,12 @@ class PriceAppApi:
         return "unknown_error"
 
     def _classify_capture_failure(self, error, window=None):
+        if "WebView 子进程无响应" in str(error or ""):
+            return {
+                "error_code": "timeout",
+                "status_label": self._error_label("timeout"),
+                "auth_required": False,
+            }
         current_url = ""
         if window:
             try:
@@ -3885,22 +4322,34 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Sub2API relay price comparison desktop app")
     parser.add_argument("--site", default="", help="optional target site URL")
     parser.add_argument("--devtools", action="store_true", help="open control-window debug mode")
+    parser.add_argument("--browser-host", action="store_true", help=argparse.SUPPRESS)
+    parser.add_argument("--browser-host-port", type=int, default=0, help=argparse.SUPPRESS)
+    parser.add_argument("--browser-host-token", default="", help=argparse.SUPPRESS)
+    parser.add_argument("--browser-host-storage", default="", help=argparse.SUPPRESS)
     return parser.parse_args()
 
 
 def main():
+    args = parse_args()
+    if args.browser_host:
+        return run_browser_host(args)
     if not acquire_single_instance():
         return 0
     api = None
+    browser_manager = None
     profile_dir = None
     try:
         configure_logging()
-        args = parse_args()
         site = normalize_site(args.site) if str(args.site or "").strip() else ""
         api = PriceAppApi(site)
         profile_dir = webview_profile_dir()
         profile_dir.mkdir(parents=True, exist_ok=True)
         cleanup_webview_processes(profile_dir, "startup")
+        browser_manager = BrowserProcessManager(profile_dir)
+        browser_manager.ensure_started()
+        api.attach_browser_window(browser_manager.window("login"))
+        for slot in range(MAX_SITE_WORKERS):
+            api.attach_worker_window(browser_manager.window(f"worker-{slot}"), slot)
         LOGGER.info(
             "Starting %s %s frozen=%s data_dir=%s",
             APP_NAME,
@@ -3918,36 +4367,11 @@ def main():
             text_select=True,
         )
         api.attach_controller_window(controller)
-        browser = webview.create_window(
-            "目标站点 WebView 登录",
-            url=BLANK_PAGE,
-            js_api=api.credential_bridge,
-            width=1120,
-            height=820,
-            min_size=(760, 520),
-            hidden=True,
-            focus=False,
-            text_select=True,
-        )
-        api.attach_browser_window(browser)
-        for slot in range(MAX_SITE_WORKERS):
-            worker = webview.create_window(
-                f"后台价格抓取 {slot + 1}",
-                url=BLANK_PAGE,
-                width=960,
-                height=720,
-                min_size=(640, 480),
-                hidden=True,
-                focus=False,
-                text_select=False,
-            )
-            api.attach_worker_window(worker, slot)
 
         webview.start(
             gui="edgechromium",
             debug=args.devtools,
-            private_mode=False,
-            storage_path=str(profile_dir),
+            private_mode=True,
         )
         return 0
     except Exception as exc:
@@ -3967,6 +4391,8 @@ def main():
     finally:
         if api:
             api.shutdown(wait=True)
+        if browser_manager:
+            browser_manager.shutdown()
         if profile_dir:
             cleanup_webview_processes(profile_dir, "shutdown")
         release_single_instance()
@@ -3974,4 +4400,5 @@ def main():
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    exit_code = main()
+    os._exit(int(exit_code or 0))

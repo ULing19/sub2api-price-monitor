@@ -214,6 +214,19 @@ class PriceAppLifecycleTests(unittest.TestCase):
         self.assertFalse(api._window_alive(window))
         self.assertEqual(window.url_probe_count, 0)
 
+    def test_webview_host_timeout_is_classified_without_reopening_window(self):
+        api = self.new_api()
+        window = FakeBrowserWindow()
+
+        failure = api._classify_capture_failure(
+            "WebView 子进程无响应，已自动重启",
+            window,
+        )
+
+        self.assertEqual(failure["error_code"], "timeout")
+        self.assertFalse(failure["auth_required"])
+        self.assertEqual(window.url_probe_count, 0)
+
     def test_relogin_reuses_precreated_window(self):
         api = self.new_api()
         browser = FakeBrowserWindow()
