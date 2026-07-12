@@ -14,13 +14,17 @@ import queue
 import random
 import re
 import secrets
+import smtplib
 import socket
+import ssl
 import subprocess
 import sys
 import threading
 import time
 from ctypes import wintypes
 from datetime import datetime, timedelta, timezone
+from email.message import EmailMessage
+from email.utils import parseaddr
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlparse, urlunparse
 from urllib.request import ProxyHandler, Request, build_opener
@@ -50,6 +54,10 @@ OUTPUT_FIELDS = [
     "group_id",
     "group_name",
     "group_platform",
+    "group_status",
+    "is_exclusive",
+    "subscription_type",
+    "rpm_limit",
     "plan_id",
     "plan_name",
     "price",
@@ -60,6 +68,10 @@ OUTPUT_FIELDS = [
     "validity_days",
     "validity_unit",
     "rate_multiplier",
+    "base_rate_multiplier",
+    "user_rate_multiplier",
+    "rate_source",
+    "rate_data_complete",
     "peak_rate_enabled",
     "peak_start",
     "peak_end",
@@ -76,11 +88,22 @@ OUTPUT_FIELDS = [
 
 
 APP_NAME = "Sub2APIPriceMonitor"
-APP_VERSION = "1.1.0"
+APP_VERSION = "1.2.0"
 APP_WINDOW_TITLE = "Sub2API 中转站比价"
 LOGGER = logging.getLogger(APP_NAME)
-SHUTDOWN_JOIN_TIMEOUT_SECONDS = 1.0
+SHUTDOWN_JOIN_TIMEOUT_SECONDS = 3.0
 CHANGE_HISTORY_LIMIT = 500
+SITE_CHECK_HISTORY_LIMIT = 20
+PRICE_HISTORY_FILE_LIMIT = 500
+PRICE_HISTORY_RETENTION_DAYS = 90
+NOTIFICATION_LOG_LIMIT = 100
+NOTIFICATION_TIMEOUT_SECONDS = 12
+NOTIFICATION_SETTINGS_LOCK = threading.RLock()
+SMTP_SETTINGS_OPERATION_LOCK = threading.RLock()
+SMTP_CLIENTS_LOCK = threading.RLock()
+SMTP_ACTIVE_CLIENTS = set()
+SMTP_CREDENTIAL_TARGET = f"{APP_NAME}:notification:smtp"
+SEVERITY_ORDER = {"low": 0, "medium": 1, "high": 2}
 
 
 AUTH_ERROR_PATTERNS = (
@@ -167,13 +190,7 @@ NETWORK_ERROR_PATTERNS = (
     r"网络",
 )
 
-REAUTH_ELIGIBLE_ERROR_CODES = {
-    "reauth_required",
-    "cloudflare_challenge",
-    "http_error",
-    "unsupported_response",
-    "no_price_data",
-}
+REAUTH_ELIGIBLE_ERROR_CODES = {"reauth_required"}
 
 
 class _CREDENTIAL_ATTRIBUTEW(ctypes.Structure):
@@ -234,12 +251,11 @@ def credential_target(site):
     return f"{APP_NAME}:{safe_host(normalized)[:80]}:{digest}"
 
 
-def read_site_credentials(site):
+def read_credential_payload(target):
     if not _cred_read:
         return None
-    normalized = normalize_site(site)
     pointer = ctypes.POINTER(_CREDENTIALW)()
-    if not _cred_read(credential_target(normalized), CRED_TYPE_GENERIC, 0, ctypes.byref(pointer)):
+    if not _cred_read(str(target), CRED_TYPE_GENERIC, 0, ctypes.byref(pointer)):
         error = ctypes.get_last_error()
         if error == ERROR_NOT_FOUND:
             return None
@@ -248,53 +264,42 @@ def read_site_credentials(site):
         credential = pointer.contents
         blob = ctypes.string_at(credential.CredentialBlob, credential.CredentialBlobSize)
         payload = json.loads(blob.decode("utf-8"))
-        if normalize_site(payload.get("site", "")) != normalized:
+        if not isinstance(payload, dict):
             return None
-        return {
-            "site": normalized,
-            "username": str(payload.get("username") or credential.UserName or ""),
-            "password": str(payload.get("password") or ""),
-        }
+        payload = dict(payload)
+        payload.setdefault("username", str(credential.UserName or ""))
+        return payload
     except (UnicodeDecodeError, json.JSONDecodeError, ValueError):
         return None
     finally:
         _cred_free(pointer)
 
 
-def write_site_credentials(site, username, password):
+def write_credential_payload(target, payload, username="", comment=""):
     if not _cred_write:
-        raise RuntimeError("保存密码仅支持 Windows 凭据管理器")
-    normalized = normalize_site(site)
-    username = str(username or "").strip()[:512]
-    password = str(password or "")
-    if not password:
-        raise ValueError("密码不能为空")
-    payload = json.dumps({
-        "site": normalized,
-        "username": username,
-        "password": password,
-    }, ensure_ascii=False).encode("utf-8")
-    if len(payload) > 2500:
-        raise ValueError("登录凭据过长，无法保存到 Windows 凭据管理器")
-    blob = (ctypes.c_ubyte * len(payload)).from_buffer_copy(payload)
+        raise RuntimeError("保存秘密仅支持 Windows 凭据管理器")
+    encoded = json.dumps(dict(payload or {}), ensure_ascii=False).encode("utf-8")
+    if len(encoded) > 2500:
+        raise ValueError("凭据过长，无法保存到 Windows 凭据管理器")
+    blob = (ctypes.c_ubyte * len(encoded)).from_buffer_copy(encoded)
     credential = _CREDENTIALW()
     credential.Type = CRED_TYPE_GENERIC
-    credential.TargetName = credential_target(normalized)
-    credential.Comment = f"{APP_NAME} saved login for {normalized}"
-    credential.CredentialBlobSize = len(payload)
+    credential.TargetName = str(target)
+    credential.Comment = str(comment or f"{APP_NAME} protected secret")
+    credential.CredentialBlobSize = len(encoded)
     credential.CredentialBlob = ctypes.cast(blob, ctypes.POINTER(ctypes.c_ubyte))
     credential.Persist = CRED_PERSIST_LOCAL_MACHINE
-    credential.UserName = username
+    credential.UserName = str(username or "").strip()[:512]
     if not _cred_write(ctypes.byref(credential), 0):
         error = ctypes.get_last_error()
         raise OSError(error, "写入 Windows 凭据失败")
     return True
 
 
-def delete_site_credentials(site):
+def delete_credential_payload(target):
     if not _cred_delete:
         return False
-    if _cred_delete(credential_target(site), CRED_TYPE_GENERIC, 0):
+    if _cred_delete(str(target), CRED_TYPE_GENERIC, 0):
         return True
     error = ctypes.get_last_error()
     if error == ERROR_NOT_FOUND:
@@ -302,9 +307,110 @@ def delete_site_credentials(site):
     raise OSError(error, "删除 Windows 凭据失败")
 
 
+def read_site_credentials(site):
+    normalized = normalize_site(site)
+    payload = read_credential_payload(credential_target(normalized))
+    if not payload:
+        return None
+    try:
+        if normalize_site(payload.get("site", "")) != normalized:
+            return None
+    except ValueError:
+        return None
+    return {
+        "site": normalized,
+        "username": str(payload.get("username") or ""),
+        "password": str(payload.get("password") or ""),
+    }
+
+
+def write_site_credentials(site, username, password):
+    normalized = normalize_site(site)
+    username = str(username or "").strip()[:512]
+    password = str(password or "")
+    if not password:
+        raise ValueError("密码不能为空")
+    return write_credential_payload(
+        credential_target(normalized),
+        {"site": normalized, "username": username, "password": password},
+        username=username,
+        comment=f"{APP_NAME} saved login for {normalized}",
+    )
+
+
+def delete_site_credentials(site):
+    return delete_credential_payload(credential_target(site))
+
+
 def has_site_credentials(site):
     credential = read_site_credentials(site)
     return bool(credential and credential.get("password"))
+
+
+def smtp_credential_identity(settings):
+    normalized = normalize_smtp_settings(settings or {})
+    return {
+        "host": normalized["host"].lower(),
+        "port": normalized["port"],
+        "security": normalized["security"],
+        "username": normalized["username"],
+    }
+
+
+def read_smtp_password(settings=None):
+    payload = read_credential_payload(SMTP_CREDENTIAL_TARGET)
+    if not payload:
+        return ""
+    secret = str(payload.get("password") or "")
+    if not secret or settings is None:
+        return secret
+    requested = smtp_credential_identity(settings)
+    stored = {
+        key: payload.get(key)
+        for key in ("host", "port", "security", "username")
+        if key in payload
+    }
+    if stored:
+        try:
+            stored["port"] = int(stored.get("port") or 0)
+        except (TypeError, ValueError):
+            return ""
+        stored["host"] = str(stored.get("host") or "").lower()
+        stored["security"] = str(stored.get("security") or "").lower()
+        stored["username"] = str(stored.get("username") or "")
+        return secret if stored == requested else ""
+
+    # Credentials created before 1.2.0 had no server identity. They are only
+    # accepted for the currently persisted settings, never for an edited form.
+    current = smtp_credential_identity(load_smtp_settings())
+    credential_username = str(payload.get("username") or "")
+    if requested == current and credential_username == requested["username"]:
+        return secret
+    return ""
+
+
+def write_smtp_password(password, username="", settings=None):
+    secret = str(password or "")
+    if not secret:
+        raise ValueError("SMTP 密码不能为空")
+    identity = smtp_credential_identity(settings or {
+        **load_smtp_settings(),
+        "username": username,
+    })
+    return write_credential_payload(
+        SMTP_CREDENTIAL_TARGET,
+        {"password": secret, **identity},
+        username=identity["username"],
+        comment=f"{APP_NAME} SMTP password",
+    )
+
+
+def delete_smtp_password():
+    return delete_credential_payload(SMTP_CREDENTIAL_TARGET)
+
+
+def has_smtp_password(settings=None):
+    return bool(read_smtp_password(settings))
 
 
 def focus_existing_instance():
@@ -424,7 +530,53 @@ def log_path():
 def redact_log_text(value):
     text = str(value or "")
     text = re.sub(
+        r"(?i)\b([a-z][a-z0-9+.-]*://[^/\s:@]+:)([^@\s/]+)(@)",
+        r"\1<redacted>\3",
+        text,
+    )
+    text = re.sub(
+        r"(?i)\b((?:set-cookie|cookie)\s*:\s*)[^\r\n]+",
+        r"\1<redacted>",
+        text,
+    )
+    text = re.sub(
         r"(?i)(bearer\s+)[A-Za-z0-9._~+\-/]+=*",
+        r"\1<redacted>",
+        text,
+    )
+    text = re.sub(
+        r"(?i)(basic\s+)[A-Za-z0-9+/]+=*",
+        r"\1<redacted>",
+        text,
+    )
+    text = re.sub(
+        r'''(?ix)
+        (?P<prefix>
+            ["']?\b(?:access[_-]?token|refresh[_-]?token|id[_-]?token|auth[_-]?token|token|
+            api[_-]?key|client[_-]?secret|session(?:[_-]?id)?|password|passwd|pwd)["']?
+            \s*[:=]\s*
+        )
+        (?P<quote>["'])
+        .*?
+        (?P=quote)
+        ''',
+        r"\g<prefix>\g<quote><redacted>\g<quote>",
+        text,
+    )
+    text = re.sub(
+        r'''(?ix)
+        (?P<prefix>
+            ["']?\b(?:access[_-]?token|refresh[_-]?token|id[_-]?token|auth[_-]?token|token|
+            api[_-]?key|client[_-]?secret|session(?:[_-]?id)?|password|passwd|pwd)["']?
+            \s*[:=]\s*["']?
+        )
+        [^"'&;,\s}\]]+
+        ''',
+        r"\g<prefix><redacted>",
+        text,
+    )
+    text = re.sub(
+        r"(?i)\b(auth(?:entication)?\s+(?:plain|login)\s+)([^\s]+)",
         r"\1<redacted>",
         text,
     )
@@ -534,10 +686,38 @@ def saved_sites_path():
     return output_dir() / "price-sites.json"
 
 
+def notification_settings_path():
+    return output_dir() / "notification-settings.json"
+
+
+def notification_logs_path():
+    return output_dir() / "notification-logs.json"
+
+
 def price_history_dir():
     path = output_dir() / "price-history"
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def prune_price_history(max_files=PRICE_HISTORY_FILE_LIMIT, retention_days=PRICE_HISTORY_RETENTION_DAYS):
+    directory = price_history_dir()
+    cutoff = time.time() - max(1, int(retention_days)) * 86400
+    files = []
+    for path in directory.glob("prices-*.json"):
+        try:
+            modified = path.stat().st_mtime
+        except OSError:
+            continue
+        files.append((modified, path))
+    files.sort(key=lambda item: item[0], reverse=True)
+    for index, (modified, path) in enumerate(files):
+        if index < max(1, int(max_files)) and modified >= cutoff:
+            continue
+        try:
+            path.unlink()
+        except OSError:
+            LOGGER.warning("Failed to remove old price history file: %s", path)
 
 
 def latest_prices_json_path():
@@ -556,6 +736,338 @@ def price_change_baselines_path():
     return output_dir() / "price-change-baselines.json"
 
 
+def default_smtp_settings():
+    return {
+        "enabled": False,
+        "host": "",
+        "port": 587,
+        "security": "starttls",
+        "username": "",
+        "from_address": "",
+        "recipients": [],
+        "subject_prefix": "[Sub2API Monitor]",
+        "min_severity": "low",
+        "notify_changes": True,
+        "notify_site_errors": True,
+        "notify_recoveries": True,
+        "updated_at": "",
+        "last_sent_at": "",
+        "last_test_at": "",
+        "last_error": "",
+    }
+
+
+def normalize_smtp_settings(settings):
+    source = dict(settings or {})
+    normalized = default_smtp_settings()
+    normalized.update({key: source.get(key) for key in normalized if key in source})
+    try:
+        port = int(normalized.get("port") or 587)
+    except (TypeError, ValueError):
+        port = 587
+    normalized["port"] = min(65535, max(1, port))
+    security = str(normalized.get("security") or "starttls").strip().lower()
+    normalized["security"] = security if security in {"ssl", "starttls", "none"} else "starttls"
+    severity = str(normalized.get("min_severity") or "low").strip().lower()
+    normalized["min_severity"] = severity if severity in SEVERITY_ORDER else "low"
+    recipients = normalized.get("recipients") or []
+    if isinstance(recipients, str):
+        recipients = re.split(r"[,;\n]+", recipients)
+    normalized["recipients"] = [
+        str(item).strip() for item in recipients if str(item or "").strip()
+    ]
+    for key in ("enabled", "notify_changes", "notify_site_errors", "notify_recoveries"):
+        normalized[key] = bool(normalized.get(key))
+    for key in (
+        "host",
+        "username",
+        "from_address",
+        "subject_prefix",
+        "updated_at",
+        "last_sent_at",
+        "last_test_at",
+        "last_error",
+    ):
+        normalized[key] = str(normalized.get(key) or "").strip()
+    return normalized
+
+
+def load_smtp_settings():
+    with NOTIFICATION_SETTINGS_LOCK:
+        path = notification_settings_path()
+        if not path.exists():
+            return default_smtp_settings()
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            return normalize_smtp_settings(data if isinstance(data, dict) else {})
+        except Exception:
+            LOGGER.exception("Failed to load SMTP settings from %s", path)
+            return default_smtp_settings()
+
+
+def write_smtp_settings(settings):
+    normalized = normalize_smtp_settings(settings)
+    with NOTIFICATION_SETTINGS_LOCK:
+        atomic_write_text(
+            notification_settings_path(),
+            json.dumps(normalized, ensure_ascii=False, indent=2) + "\n",
+        )
+    return normalized
+
+
+def update_smtp_delivery_state(**fields):
+    allowed = {"last_sent_at", "last_test_at", "last_error"}
+    with NOTIFICATION_SETTINGS_LOCK:
+        current = load_smtp_settings()
+        for key, value in fields.items():
+            if key in allowed:
+                current[key] = str(value or "").strip()
+        return write_smtp_settings(current)
+
+
+def load_notification_logs(limit=NOTIFICATION_LOG_LIMIT):
+    with NOTIFICATION_SETTINGS_LOCK:
+        path = notification_logs_path()
+        if not path.exists():
+            return []
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            logs = data.get("logs") if isinstance(data, dict) else data
+            if not isinstance(logs, list):
+                return []
+            return [dict(item) for item in logs if isinstance(item, dict)][
+                :max(1, int(limit or NOTIFICATION_LOG_LIMIT))
+            ]
+        except Exception:
+            LOGGER.exception("Failed to load notification logs from %s", path)
+            return []
+
+
+def append_notification_log(entry):
+    with NOTIFICATION_SETTINGS_LOCK:
+        logs = [dict(entry or {})] + load_notification_logs()
+        payload = {
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "logs": logs[:NOTIFICATION_LOG_LIMIT],
+        }
+        atomic_write_text(
+            notification_logs_path(),
+            json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+        )
+    return logs[:NOTIFICATION_LOG_LIMIT]
+
+
+def _valid_email_address(value):
+    address = str(value or "").strip()
+    parsed = parseaddr(address)[1]
+    return bool(parsed and parsed == address and "@" in parsed and "\r" not in parsed and "\n" not in parsed)
+
+
+def validate_smtp_settings(settings, require_enabled=False, require_password=False):
+    normalized = normalize_smtp_settings(settings)
+    if require_enabled and not normalized["enabled"]:
+        raise ValueError("请先启用 SMTP 通知")
+    if not normalized["host"]:
+        raise ValueError("SMTP 服务器不能为空")
+    if not _valid_email_address(normalized["from_address"]):
+        raise ValueError("发件人邮箱格式不正确")
+    if not normalized["recipients"]:
+        raise ValueError("至少需要一个收件人")
+    invalid = [item for item in normalized["recipients"] if not _valid_email_address(item)]
+    if invalid:
+        raise ValueError(f"收件人邮箱格式不正确：{invalid[0]}")
+    if require_password and normalized["username"] and not has_smtp_password(normalized):
+        raise ValueError("尚未保存 SMTP 密码")
+    return normalized
+
+
+def masked_email(value):
+    address = str(value or "").strip()
+    if "@" not in address:
+        return "<未配置>"
+    local, domain = address.rsplit("@", 1)
+    visible = local[:2] if len(local) > 2 else local[:1]
+    return f"{visible}***@{domain}"
+
+
+NOTIFICATION_CHANGE_LABELS = {
+    "rate_changed": "倍率变化",
+    "price_changed": "价格变化",
+    "added": "新增项目",
+    "removed": "移除项目",
+    "details_changed": "信息变化",
+    "status_changed": "分组状态",
+    "is_exclusive_changed": "专属属性",
+    "subscription_type_changed": "订阅类型",
+    "rpm_limit_changed": "RPM 限制",
+    "platform_changed": "平台变化",
+    "site_error": "抓取失败",
+    "site_unhealthy": "站点故障",
+    "site_recovered": "站点恢复",
+}
+
+NOTIFICATION_DIRECTION_LABELS = {
+    "increase": "上涨",
+    "decrease": "下降",
+    "added": "新增",
+    "removed": "移除",
+    "degraded": "恶化",
+    "recovered": "恢复",
+    "changed": "变更",
+}
+
+
+def _notification_value(value):
+    if value is None or value == "":
+        return "—"
+    if isinstance(value, (dict, list)):
+        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))[:240]
+    return str(value)[:240]
+
+
+def build_smtp_change_message(changes):
+    selected = [dict(item) for item in changes or [] if isinstance(item, dict)]
+    if not selected:
+        return "监控变化", "没有可发送的变化。"
+
+    def item_line(item):
+        severity = str(item.get("severity") or "low").upper()
+        site = str(item.get("site_host") or item.get("site") or "未知站点")
+        label = NOTIFICATION_CHANGE_LABELS.get(
+            str(item.get("change_type") or ""),
+            str(item.get("change_type") or "变化"),
+        )
+        old_value = _notification_value(item.get("old_value"))
+        new_value = _notification_value(item.get("new_value"))
+        values = ""
+        if old_value != "—" or new_value != "—":
+            values = f" · {old_value} -> {new_value}"
+        message = str(item.get("message") or item.get("item_label") or "").strip()
+        return f"[{severity}] {site} · {label}{values}" + (f" · {message}" if message else "")
+
+    now = datetime.now().astimezone().strftime("%Y-%m-%d %H:%M:%S")
+    if len(selected) == 1:
+        item = selected[0]
+        site = str(item.get("site_host") or item.get("site") or "未知站点")
+        change_label = NOTIFICATION_CHANGE_LABELS.get(
+            str(item.get("change_type") or ""),
+            str(item.get("change_type") or "变化"),
+        )
+        direction = NOTIFICATION_DIRECTION_LABELS.get(
+            str(item.get("direction") or "changed"),
+            "变更",
+        )
+        subject = f"{site} · {change_label} · {direction}"[:180]
+        body = "\n".join([
+            f"检测时间：{now}",
+            f"站点：{site}",
+            f"变化：{change_label}（{direction}）",
+            f"旧值：{_notification_value(item.get('old_value'))}",
+            f"新值：{_notification_value(item.get('new_value'))}",
+            "",
+            str(item.get("message") or item.get("item_label") or ""),
+        ]).rstrip()
+        return subject, body
+
+    group_order = (
+        ("increase", "上涨"),
+        ("decrease", "下降"),
+        ("added", "新增"),
+        ("removed", "移除"),
+        ("degraded", "故障与恶化"),
+        ("recovered", "恢复"),
+        ("changed", "其他变化"),
+    )
+    grouped = {key: [] for key, _ in group_order}
+    for item in selected:
+        direction = str(item.get("direction") or "changed")
+        grouped.setdefault(direction if direction in grouped else "changed", []).append(item)
+    high_count = sum(1 for item in selected if item.get("severity") == "high")
+    subject = f"{len(selected)} 条监控变化"
+    if high_count:
+        subject += f" · {high_count} 条高优先级"
+    lines = [f"检测时间：{now}", f"变化数量：{len(selected)}", ""]
+    for key, label in group_order:
+        items = grouped.get(key) or []
+        if not items:
+            continue
+        lines.append(f"{label}（{len(items)}）")
+        lines.extend(item_line(item) for item in items[:40])
+        if len(items) > 40:
+            lines.append(f"…另有 {len(items) - 40} 条")
+        lines.append("")
+    return subject[:180], "\n".join(lines).rstrip()
+
+
+def smtp_public_state():
+    settings = load_smtp_settings()
+    return {
+        **settings,
+        "has_password": has_smtp_password(settings),
+        "logs": load_notification_logs(),
+    }
+
+
+def send_smtp_message(settings, subject, body, password=None):
+    normalized = validate_smtp_settings(settings, require_password=False)
+    secret = read_smtp_password(normalized) if password is None else str(password or "")
+    if normalized["username"] and not secret:
+        raise ValueError("尚未保存 SMTP 密码")
+    message = EmailMessage()
+    prefix = normalized["subject_prefix"].replace("\r", " ").replace("\n", " ").strip()
+    clean_subject = str(subject or "通知").replace("\r", " ").replace("\n", " ").strip()
+    message["Subject"] = f"{prefix} {clean_subject}".strip()
+    message["From"] = normalized["from_address"]
+    message["To"] = ", ".join(normalized["recipients"])
+    message.set_content(str(body or ""), subtype="plain", charset="utf-8")
+
+    context = ssl.create_default_context()
+    if normalized["security"] == "ssl":
+        client = smtplib.SMTP_SSL(
+            normalized["host"],
+            normalized["port"],
+            timeout=NOTIFICATION_TIMEOUT_SECONDS,
+            context=context,
+        )
+    else:
+        client = smtplib.SMTP(
+            normalized["host"],
+            normalized["port"],
+            timeout=NOTIFICATION_TIMEOUT_SECONDS,
+        )
+    with SMTP_CLIENTS_LOCK:
+        SMTP_ACTIVE_CLIENTS.add(client)
+    try:
+        client.ehlo()
+        if normalized["security"] == "starttls":
+            client.starttls(context=context)
+            client.ehlo()
+        if normalized["username"]:
+            client.login(normalized["username"], secret)
+        client.send_message(message)
+    finally:
+        with SMTP_CLIENTS_LOCK:
+            SMTP_ACTIVE_CLIENTS.discard(client)
+        try:
+            client.quit()
+        except Exception:
+            try:
+                client.close()
+            except Exception:
+                pass
+    return message["Subject"]
+
+
+def close_active_smtp_clients():
+    with SMTP_CLIENTS_LOCK:
+        clients = list(SMTP_ACTIVE_CLIENTS)
+    for client in clients:
+        try:
+            client.close()
+        except Exception:
+            pass
+
+
 def load_saved_sites():
     path = saved_sites_path()
     if not path.exists():
@@ -568,6 +1080,23 @@ def load_saved_sites():
         LOGGER.exception("Failed to load saved sites from %s", path)
         return []
     return []
+
+
+def saved_site_allows_credentials(site):
+    try:
+        normalized = normalize_site(site)
+    except (TypeError, ValueError):
+        return False
+    for item in load_saved_sites():
+        if not isinstance(item, dict):
+            continue
+        try:
+            item_site = normalize_site(item.get("site", ""))
+        except (TypeError, ValueError):
+            continue
+        if item_site == normalized:
+            return bool(item.get("remember_credentials", True))
+    return False
 
 
 def parse_datetime(value):
@@ -608,11 +1137,48 @@ def normalize_saved_site_record(item):
     site = str(record.get("site") or "")
     record["name"] = str(record.get("name") or site)
     record["auto_refresh"] = bool(record.get("auto_refresh", True))
+    record["include_groups"] = bool(record.get("include_groups", True))
     record["remember_credentials"] = bool(record.get("remember_credentials", True))
     record["auto_login"] = bool(record.get("auto_login", True)) and record["remember_credentials"]
     record["reauth_required"] = bool(
         record.get("reauth_required") or record.get("last_status") == "reauth_required"
     )
+    try:
+        record["consecutive_failures"] = max(0, int(record.get("consecutive_failures") or 0))
+    except (TypeError, ValueError):
+        record["consecutive_failures"] = 0
+    health = str(record.get("health_status") or "").strip().lower()
+    if record["reauth_required"]:
+        health = "needs_auth"
+    elif record.get("last_status") == "ok":
+        health = "ok"
+    elif record["consecutive_failures"] >= 3:
+        health = "failed"
+    elif record["consecutive_failures"]:
+        health = "warning"
+    elif health not in {"ok", "warning", "failed", "needs_auth", "unknown"}:
+        health = "unknown"
+    record["health_status"] = health or "unknown"
+    record["health_label"] = {
+        "ok": "正常",
+        "warning": "异常观察中",
+        "failed": "连续失败",
+        "needs_auth": "需重新授权",
+        "unknown": "尚未检查",
+    }[record["health_status"]]
+    for key in ("last_success_at", "last_failure_at"):
+        record[key] = str(record.get(key) or "")
+    for key in ("last_core_status", "last_enrichment_status", "last_enrichment_error"):
+        record[key] = str(record.get(key) or "")
+    history = record.get("check_history") or []
+    record["check_history"] = [
+        dict(entry) for entry in history if isinstance(entry, dict)
+    ][:SITE_CHECK_HISTORY_LIMIT]
+    for key in ("last_row_count", "last_plan_count", "last_group_count", "last_exclusive_count", "last_user_rate_count"):
+        try:
+            record[key] = max(0, int(record.get(key) or 0))
+        except (TypeError, ValueError):
+            record[key] = 0
     if record.get("last_status") == "ok":
         record["last_status_label"] = record.get("last_status_label") or "正常"
     elif record.get("last_error_code"):
@@ -677,6 +1243,57 @@ def _stable_change_id(change):
     return hashlib.sha256(encoded).hexdigest()[:20]
 
 
+def _change_direction(change_type, old_value=None, new_value=None):
+    if change_type == "added":
+        return "added"
+    if change_type == "removed":
+        return "removed"
+    if change_type in {"site_error", "site_unhealthy"}:
+        return "degraded"
+    if change_type == "site_recovered":
+        return "recovered"
+    old_number = _change_number(old_value)
+    new_number = _change_number(new_value)
+    if old_number is not None and new_number is not None:
+        if new_number > old_number:
+            return "increase"
+        if new_number < old_number:
+            return "decrease"
+    return "changed"
+
+
+def _change_severity(change_type, change_percent=None, source_field=""):
+    if change_type in {"site_error", "site_unhealthy", "removed"}:
+        return "high"
+    if change_type == "site_recovered":
+        return "low"
+    if change_type in {"rate_changed", "price_changed"}:
+        magnitude = abs(_change_number(change_percent) or 0)
+        if magnitude >= 20:
+            return "high"
+        if magnitude >= 5:
+            return "medium"
+        return "low"
+    if change_type in {"status_changed", "is_exclusive_changed", "rpm_limit_changed"}:
+        return "medium"
+    fields = {item.strip() for item in str(source_field or "").split(",") if item.strip()}
+    if fields & {"group_status", "is_exclusive"}:
+        return "medium"
+    return "low"
+
+
+def _numeric_change_severity(change_type, old_value, new_value, change_percent):
+    old_number = _change_number(old_value)
+    new_number = _change_number(new_value)
+    if (
+        old_number is not None
+        and new_number is not None
+        and (old_number == 0) != (new_number == 0)
+    ):
+        return "high"
+    return _change_severity(change_type, change_percent)
+
+
 def load_price_changes(limit=CHANGE_HISTORY_LIMIT):
     path = price_changes_path()
     if not path.exists():
@@ -693,6 +1310,17 @@ def load_price_changes(limit=CHANGE_HISTORY_LIMIT):
             change = dict(item)
             change["id"] = str(change.get("id") or _stable_change_id(change))
             change["acknowledged"] = bool(change.get("acknowledged", False))
+            change["direction"] = str(change.get("direction") or _change_direction(
+                change.get("change_type"),
+                change.get("old_value"),
+                change.get("new_value"),
+            ))
+            change["source_field"] = str(change.get("source_field") or "")
+            change["severity"] = str(change.get("severity") or _change_severity(
+                change.get("change_type"),
+                change.get("change_percent"),
+                change.get("source_field"),
+            ))
             normalized.append(change)
         return normalized[:max(1, int(limit or CHANGE_HISTORY_LIMIT))]
     except Exception:
@@ -789,12 +1417,19 @@ def _change_value(value):
 def _change_row_value(row):
     return {
         "rate_multiplier": _change_value(row.get("rate_multiplier")),
+        "base_rate_multiplier": _change_value(row.get("base_rate_multiplier")),
+        "user_rate_multiplier": _change_value(row.get("user_rate_multiplier")),
+        "rate_source": _change_value(row.get("rate_source")),
         "price": _change_value(row.get("price")),
         "pay_price_cny": _change_value(row.get("pay_price_cny")),
         "status": _change_value(row.get("status")),
         "model_names": _change_value(row.get("model_names")),
         "group_name": _change_value(row.get("group_name")),
         "group_platform": _change_value(row.get("group_platform")),
+        "group_status": _change_value(row.get("group_status")),
+        "is_exclusive": _change_value(row.get("is_exclusive")),
+        "subscription_type": _change_value(row.get("subscription_type")),
+        "rpm_limit": _change_value(row.get("rpm_limit")),
         "plan_name": _change_value(row.get("plan_name")),
         "validity_days": _change_value(row.get("validity_days")),
         "peak_rate_multiplier": _change_value(row.get("peak_rate_multiplier")),
@@ -862,7 +1497,12 @@ def _change_record(
     new_value=None,
     message="",
     change_percent=None,
+    source_field="",
+    direction="",
+    severity="",
 ):
+    resolved_direction = direction or _change_direction(change_type, old_value, new_value)
+    resolved_severity = severity or _change_severity(change_type, change_percent, source_field)
     return {
         "id": secrets.token_hex(10),
         "change_type": change_type,
@@ -875,6 +1515,9 @@ def _change_record(
         "old_value": old_value,
         "new_value": new_value,
         "change_percent": change_percent,
+        "source_field": str(source_field or ""),
+        "direction": resolved_direction,
+        "severity": resolved_severity,
         "message": message,
         "detected_at": detected_at,
         "acknowledged": False,
@@ -884,8 +1527,6 @@ def _change_record(
 def detect_price_changes(previous_rows, current_rows):
     previous_rows = [row for row in previous_rows or [] if isinstance(row, dict)]
     current_rows = [row for row in current_rows or [] if isinstance(row, dict)]
-    if not previous_rows:
-        return []
 
     previous_errors = {
         _change_site_key(row): row
@@ -912,6 +1553,7 @@ def detect_price_changes(previous_rows, current_rows):
                 old_value=(old_error or {}).get("error") if old_error else None,
                 new_value=error_text,
                 message=f"{host or '未知站点'} 抓取失败：{error_text}",
+                source_field="site_health",
             ))
 
     def normal_rows(rows, error_hosts):
@@ -932,6 +1574,7 @@ def detect_price_changes(previous_rows, current_rows):
             detected_at,
             new_value=_change_row_value(row),
             message=f"新增 {_change_row_label(row)}",
+            source_field="record",
         ))
 
     for key in sorted(old_map.keys() - new_map.keys(), key=str):
@@ -942,6 +1585,7 @@ def detect_price_changes(previous_rows, current_rows):
             detected_at,
             old_value=_change_row_value(row),
             message=f"移除 {_change_row_label(row)}",
+            source_field="record",
         ))
 
     detail_fields = (
@@ -949,6 +1593,13 @@ def detect_price_changes(previous_rows, current_rows):
         ("model_names", "模型"),
         ("group_name", "分组名称"),
         ("group_platform", "平台"),
+        ("group_status", "分组状态"),
+        ("is_exclusive", "专属分组"),
+        ("subscription_type", "订阅类型"),
+        ("rpm_limit", "RPM 限制"),
+        ("base_rate_multiplier", "基础倍率"),
+        ("user_rate_multiplier", "用户倍率"),
+        ("rate_source", "倍率来源"),
         ("plan_name", "套餐名称"),
         ("description", "描述"),
         ("status", "状态"),
@@ -958,12 +1609,26 @@ def detect_price_changes(previous_rows, current_rows):
         ("weekly_limit_usd", "周限额"),
         ("monthly_limit_usd", "月限额"),
     )
+    metadata_change_types = {
+        "group_status": ("status_changed", "分组状态"),
+        "is_exclusive": ("is_exclusive_changed", "专属属性"),
+        "subscription_type": ("subscription_type_changed", "订阅类型"),
+        "rpm_limit": ("rpm_limit_changed", "RPM 限制"),
+        "group_platform": ("platform_changed", "平台"),
+    }
     for key in sorted(old_map.keys() & new_map.keys(), key=str):
         old_row = old_map[key]
         new_row = new_map[key]
         old_rate = _change_number(old_row.get("rate_multiplier"))
         new_rate = _change_number(new_row.get("rate_multiplier"))
-        if old_rate != new_rate and (old_rate is not None or new_rate is not None):
+        old_rate_complete = old_row.get("rate_data_complete") is not False
+        new_rate_complete = new_row.get("rate_data_complete") is not False
+        if (
+            old_rate_complete
+            and new_rate_complete
+            and old_rate != new_rate
+            and (old_rate is not None or new_rate is not None)
+        ):
             percent = None
             if old_rate not in (None, 0) and new_rate is not None:
                 percent = round((new_rate - old_rate) / old_rate * 100, 2)
@@ -975,6 +1640,10 @@ def detect_price_changes(previous_rows, current_rows):
                 new_value=new_rate,
                 change_percent=percent,
                 message=f"{_change_row_label(new_row)} 倍率 {old_rate} -> {new_rate}",
+                source_field="rate_multiplier",
+                severity=_numeric_change_severity(
+                    "rate_changed", old_rate, new_rate, percent
+                ),
             ))
 
         old_price = _change_number(old_row.get("pay_price_cny"))
@@ -995,13 +1664,52 @@ def detect_price_changes(previous_rows, current_rows):
                 new_value=new_price,
                 change_percent=percent,
                 message=f"{_change_row_label(new_row)} 价格 {old_price} -> {new_price}",
+                source_field="pay_price_cny" if _change_number(new_row.get("pay_price_cny")) is not None else "price",
+                severity=_numeric_change_severity(
+                    "price_changed", old_price, new_price, percent
+                ),
             ))
 
-        changed_fields = [
-            label
+        changed = [
+            (field, label)
             for field, label in detail_fields
             if _change_value(old_row.get(field)) != _change_value(new_row.get(field))
+            and not (
+                field in {"user_rate_multiplier", "rate_source"}
+                and not (old_rate_complete and new_rate_complete)
+            )
         ]
+        for field, (change_type, label) in metadata_change_types.items():
+            if not any(changed_field == field for changed_field, _ in changed):
+                continue
+            old_value = _change_value(old_row.get(field))
+            new_value = _change_value(new_row.get(field))
+            percent = None
+            if field == "rpm_limit":
+                old_number = _change_number(old_value)
+                new_number = _change_number(new_value)
+                if old_number not in (None, 0) and new_number is not None:
+                    percent = round((new_number - old_number) / old_number * 100, 2)
+            severity = (
+                _numeric_change_severity(change_type, old_value, new_value, percent)
+                if field == "rpm_limit"
+                else _change_severity(change_type, percent, field)
+            )
+            changes.append(_change_record(
+                change_type,
+                new_row,
+                detected_at,
+                old_value=old_value,
+                new_value=new_value,
+                change_percent=percent,
+                message=f"{_change_row_label(new_row)} {label} {old_value} -> {new_value}",
+                source_field=field,
+                severity=severity,
+            ))
+        changed = [
+            item for item in changed if item[0] not in metadata_change_types
+        ]
+        changed_fields = [label for _, label in changed]
         if changed_fields:
             changes.append(_change_record(
                 "details_changed",
@@ -1010,6 +1718,7 @@ def detect_price_changes(previous_rows, current_rows):
                 old_value=_change_row_value(old_row),
                 new_value=_change_row_value(new_row),
                 message=f"{_change_row_label(new_row)} 变更：{'、'.join(changed_fields)}",
+                source_field=",".join(field for field, _ in changed),
             ))
 
     return changes[:CHANGE_HISTORY_LIMIT]
@@ -1029,7 +1738,93 @@ def remove_price_changes_for_site(site):
     return changes
 
 
-def write_price_snapshot(rows, summary):
+def remove_price_history_for_site(site):
+    site_key = normalize_site(site)
+    for path in price_history_dir().glob("prices-*.json"):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+            if not isinstance(payload, dict):
+                continue
+            rows = [
+                dict(item) for item in payload.get("rows") or []
+                if isinstance(item, dict) and _change_site_key(item) != site_key
+            ]
+            changes = [
+                dict(item) for item in payload.get("changes") or []
+                if isinstance(item, dict) and _change_site_key(item) != site_key
+            ]
+            if rows == (payload.get("rows") or []) and changes == (payload.get("changes") or []):
+                continue
+            payload["rows"] = rows
+            if "changes" in payload:
+                payload["changes"] = changes
+            atomic_write_text(
+                path,
+                json.dumps(payload, ensure_ascii=False, indent=2) + "\n",
+            )
+        except Exception:
+            LOGGER.exception("Failed to remove site from price history: %s", path)
+
+
+def site_status_transition_change(previous, updated):
+    previous = normalize_saved_site_record(previous or {})
+    updated = normalize_saved_site_record(updated or {})
+    if not previous.get("last_run"):
+        return None
+    old_health = previous.get("health_status") or "unknown"
+    new_health = updated.get("health_status") or "unknown"
+    if new_health == "ok" and old_health not in {"ok", "unknown"}:
+        return _change_record(
+            "site_recovered",
+            updated,
+            updated.get("last_run") or datetime.now(timezone.utc).isoformat(),
+            old_value=old_health,
+            new_value="ok",
+            message=f"{updated.get('name') or updated.get('site')} 已恢复正常",
+            source_field="site_health",
+        )
+    if new_health in {"failed", "needs_auth"} and old_health != new_health:
+        message = (
+            f"{updated.get('name') or updated.get('site')} 需要重新授权"
+            if new_health == "needs_auth"
+            else f"{updated.get('name') or updated.get('site')} 已连续失败 {updated.get('consecutive_failures', 0)} 次"
+        )
+        return _change_record(
+            "site_unhealthy",
+            updated,
+            updated.get("last_run") or datetime.now(timezone.utc).isoformat(),
+            old_value=old_health,
+            new_value=new_health,
+            message=message,
+            source_field="site_health",
+        )
+    return None
+
+
+def _baseline_rows_with_verified_rates(previous_rows, current_rows):
+    previous_map = {
+        _change_identity_key(row): row
+        for row in previous_rows or []
+        if isinstance(row, dict) and row.get("record_type") != "error"
+    }
+    merged = []
+    for row in current_rows or []:
+        current = dict(row)
+        if current.get("rate_data_complete") is False:
+            previous = previous_map.get(_change_identity_key(current))
+            if previous and previous.get("rate_data_complete") is not False:
+                for field in (
+                    "rate_multiplier",
+                    "user_rate_multiplier",
+                    "rate_source",
+                    "rate_data_complete",
+                ):
+                    current[field] = previous.get(field)
+        merged.append(current)
+    return merged
+
+
+def write_price_snapshot(rows, summary, extra_changes=None):
     previous_rows = load_latest_rows()
     baselines = load_price_change_baselines()
 
@@ -1054,11 +1849,16 @@ def write_price_snapshot(rows, summary):
         if successful_rows:
             baseline_rows = baselines.get(site_key)
             comparison_rows.extend(baseline_rows if baseline_rows is not None else successful_rows)
-            baselines[site_key] = [dict(row) for row in successful_rows]
+            baselines[site_key] = _baseline_rows_with_verified_rates(
+                baseline_rows or [],
+                successful_rows,
+            )
         else:
             comparison_rows.extend(previous_by_site.get(site_key, []))
 
-    changes = detect_price_changes(comparison_rows, rows)
+    changes = [dict(item) for item in extra_changes or [] if isinstance(item, dict)]
+    changes.extend(detect_price_changes(comparison_rows, rows))
+    changes = changes[:CHANGE_HISTORY_LIMIT]
     if changes:
         write_price_changes(changes + load_price_changes())
     write_price_change_baselines(baselines)
@@ -1073,6 +1873,7 @@ def write_price_snapshot(rows, summary):
     csv_content = rows_to_csv(rows)
     slug = generated_at.replace(":", "-").replace(".", "-")
     atomic_write_text(price_history_dir() / f"prices-{slug}.json", json_content)
+    prune_price_history()
     atomic_write_text(latest_prices_csv_path(), csv_content, encoding="utf-8-sig")
     atomic_write_text(latest_prices_json_path(), json_content)
     return payload
@@ -1134,7 +1935,7 @@ def row_price(row):
 
 
 def row_identity_key(row):
-    site = row.get("site_host") or urlparse(str(row.get("site") or "")).netloc or row.get("site") or ""
+    site = _change_site_key(row)
     return tuple(
         str(value or "").strip().lower()
         for value in (
@@ -1168,25 +1969,20 @@ def merge_price_rows(previous_rows, fresh_rows):
 
 
 def replace_price_rows(previous_rows, fresh_rows, refreshed_sites):
-    refreshed_hosts = set()
+    refreshed_site_keys = set()
     for site in refreshed_sites or []:
         try:
-            host = urlparse(normalize_site(site)).netloc.lower()
+            site_key = normalize_site(site)
         except (TypeError, ValueError):
-            host = ""
-        if host:
-            refreshed_hosts.add(host)
+            site_key = ""
+        if site_key:
+            refreshed_site_keys.add(site_key)
 
     retained_rows = []
     for row in previous_rows or []:
         if not isinstance(row, dict):
             continue
-        host = str(
-            row.get("site_host")
-            or urlparse(str(row.get("site") or "")).netloc
-            or ""
-        ).lower()
-        if host not in refreshed_hosts:
+        if _change_site_key(row) not in refreshed_site_keys:
             retained_rows.append(row)
     return merge_price_rows(retained_rows, fresh_rows)
 
@@ -1587,7 +2383,7 @@ CONTROL_HTML = r"""<!doctype html>
     button.primary { border-color: var(--accent); background: var(--accent); color: #fff; }
     button.primary:hover:not(:disabled) { border-color: #ea580c; background: #ea580c; }
     button.danger { color: var(--red); }
-    input[type="url"], input[type="text"], input[type="number"], input[type="search"], select {
+    input[type="url"], input[type="text"], input[type="number"], input[type="search"], input[type="email"], input[type="password"], select, textarea {
       width: 100%;
       height: 36px;
       border: 1px solid var(--border-strong);
@@ -1597,6 +2393,7 @@ CONTROL_HTML = r"""<!doctype html>
       color: var(--text);
       font-size: 13px;
     }
+    textarea { min-height: 76px; height: auto; resize: vertical; padding: 9px 10px; line-height: 1.4; }
     input:focus, select:focus { border-color: var(--blue); outline: 3px solid rgba(37, 99, 235, 0.11); }
     label { display: grid; gap: 6px; color: #525866; font-size: 12px; font-weight: 650; }
     [hidden] { display: none !important; }
@@ -1610,6 +2407,7 @@ CONTROL_HTML = r"""<!doctype html>
       border-right: 1px solid var(--border);
       background: #fbfbfc;
     }
+    .sidebar > * { min-width: 0; max-width: 100%; }
     .brand { display: flex; align-items: center; gap: 10px; padding: 0 4px; }
     .brand-mark {
       display: grid;
@@ -1692,6 +2490,7 @@ CONTROL_HTML = r"""<!doctype html>
     .tab-button.active { border-color: var(--border); background: #fff; color: #111827; box-shadow: 0 2px 7px rgba(17, 24, 39, 0.08); }
     .top-actions { display: flex; align-items: center; justify-content: flex-end; gap: 7px; }
     .top-actions button { padding: 0 10px; }
+    .topbar.compact { display: flex; }
     .view-host { min-width: 0; min-height: 0; overflow: hidden; }
     .view { width: 100%; height: 100%; min-width: 0; min-height: 0; }
     .price-view {
@@ -1737,6 +2536,52 @@ CONTROL_HTML = r"""<!doctype html>
     .section-head h2 { margin: 0; font-size: 18px; }
     .section-head p { margin: 5px 0 0; color: var(--muted); font-size: 12px; }
     .settings-layout { display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(270px, 0.75fr); gap: 14px; align-items: start; }
+    .health-summary { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 9px; margin-bottom: 12px; }
+    .site-monitor-toolbar { display: grid; grid-template-columns: minmax(180px, 1fr) minmax(140px, 0.35fr) minmax(140px, 0.35fr); gap: 9px; margin-bottom: 10px; }
+    .health-metric { border: 1px solid var(--border); border-radius: 8px; background: var(--panel); padding: 10px 12px; }
+    .health-metric span { display: block; color: var(--muted); font-size: 11px; }
+    .health-metric strong { display: block; margin-top: 3px; font-size: 17px; }
+    .site-table-wrap { margin-bottom: 14px; overflow: auto; border: 1px solid var(--border); border-radius: 8px; background: var(--panel); }
+    .site-monitor-table { min-width: 930px; }
+    .site-monitor-table td { vertical-align: middle; }
+    .site-name-button { height: auto; min-height: 32px; padding: 4px 7px; border-color: transparent; background: transparent; text-align: left; white-space: normal; }
+    .site-name-button strong, .site-name-button small { display: block; }
+    .site-name-button small { color: var(--muted); margin-top: 2px; font-weight: 400; }
+    .health-badge, .meta-badge, .severity-badge, .direction-badge {
+      display: inline-flex;
+      align-items: center;
+      min-height: 24px;
+      border-radius: 6px;
+      padding: 2px 7px;
+      font-size: 11px;
+      font-weight: 750;
+      white-space: nowrap;
+    }
+    .health-badge.ok { background: #ecfdf5; color: #047857; }
+    .health-badge.warning { background: #fffbeb; color: #b45309; }
+    .health-badge.failed, .health-badge.needs_auth { background: #fef2f2; color: #b91c1c; }
+    .health-badge.unknown { background: #f3f4f6; color: #6b7280; }
+    .site-row-actions { display: flex; align-items: center; gap: 6px; }
+    .site-row-actions button { width: 34px; padding: 0; font-size: 17px; }
+    .site-row-actions button.checking { color: var(--accent); }
+    .site-detail { margin-bottom: 14px; border-top: 1px solid var(--border); border-bottom: 1px solid var(--border); padding: 14px 0; }
+    .site-detail-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 12px; margin-bottom: 10px; }
+    .site-detail-head h3 { margin: 0; font-size: 14px; }
+    .site-detail-head p { margin: 4px 0 0; color: var(--muted); font-size: 11px; overflow-wrap: anywhere; }
+    .site-detail-actions { display: flex; gap: 6px; }
+    .site-detail-stats { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 10px; }
+    .site-detail-error { margin-bottom: 10px; padding: 9px 10px; border-left: 3px solid var(--danger); background: #fff7f5; color: #8d2f25; font-size: 11px; overflow-wrap: anywhere; }
+    .site-detail-section-title { margin: 12px 0 7px; font-size: 11px; color: var(--muted); text-transform: uppercase; }
+    .site-recent-changes { display: grid; gap: 6px; }
+    .site-recent-change { display: grid; grid-template-columns: 90px minmax(0, 1fr) auto; gap: 8px; align-items: center; padding: 7px 0; border-bottom: 1px solid var(--border); font-size: 11px; }
+    .site-recent-change:last-child { border-bottom: 0; }
+    .connection-test-result { margin-top: 10px; padding: 9px 10px; border-left: 3px solid var(--accent); background: #f3f8f6; color: var(--text); font-size: 11px; overflow-wrap: anywhere; }
+    .meta-badge { background: #f3f4f6; color: #4b5563; }
+    .meta-badge.exclusive { background: #fff7ed; color: #c2410c; }
+    .meta-badge.user-rate { background: #eff6ff; color: #1d4ed8; }
+    .site-groups { display: grid; gap: 6px; }
+    .site-group-row { display: grid; grid-template-columns: minmax(140px, 1.3fr) repeat(4, minmax(85px, 0.7fr)); gap: 8px; align-items: center; padding: 8px 9px; background: #fafafa; border: 1px solid #eceef1; border-radius: 7px; font-size: 11px; }
+    .site-group-row strong { font-size: 12px; overflow-wrap: anywhere; }
     .tool-panel { border: 1px solid var(--border); border-radius: 8px; background: var(--panel); padding: 16px; }
     .tool-panel h3 { margin: 0 0 14px; font-size: 14px; }
     .settings-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
@@ -1777,14 +2622,40 @@ CONTROL_HTML = r"""<!doctype html>
     }
     .change-kind.rate_changed, .change-kind.price_changed { background: #fff7ed; color: #c2410c; }
     .change-kind.added { background: #ecfdf5; color: #047857; }
-    .change-kind.removed, .change-kind.site_error { background: #fef2f2; color: #b91c1c; }
+    .change-kind.removed, .change-kind.site_error, .change-kind.site_unhealthy { background: #fef2f2; color: #b91c1c; }
+    .change-kind.site_recovered { background: #ecfdf5; color: #047857; }
     .change-value { max-width: 190px; color: #4b5563; overflow-wrap: anywhere; }
     .changes-footer { display: flex; justify-content: flex-end; color: var(--muted); font-size: 12px; }
+    .severity-badge.low { background: #eff6ff; color: #1d4ed8; }
+    .severity-badge.medium { background: #fffbeb; color: #b45309; }
+    .severity-badge.high { background: #fef2f2; color: #b91c1c; }
+    .direction-badge { background: #f3f4f6; color: #4b5563; }
+    .direction-badge.increase { background: #fef2f2; color: #b91c1c; }
+    .direction-badge.decrease, .direction-badge.recovered { background: #ecfdf5; color: #047857; }
+    .notifications-view { padding: 18px; overflow: auto; }
+    .notification-layout { display: grid; grid-template-columns: minmax(0, 1.25fr) minmax(290px, 0.75fr); gap: 14px; align-items: start; }
+    .smtp-status { display: grid; gap: 8px; }
+    .status-line { display: flex; justify-content: space-between; gap: 12px; padding-bottom: 8px; border-bottom: 1px solid #eceef1; font-size: 12px; }
+    .status-line span { color: var(--muted); }
+    .status-line strong { text-align: right; overflow-wrap: anywhere; }
+    .notification-log { display: grid; gap: 6px; max-height: 320px; overflow: auto; }
+    .notification-log-row { padding: 8px 9px; border: 1px solid #eceef1; border-radius: 7px; background: #fafafa; font-size: 11px; }
+    .notification-log-row strong, .notification-log-row span { display: block; }
+    .notification-log-row span { margin-top: 3px; color: var(--muted); overflow-wrap: anywhere; }
     .logs-view { padding: 18px; }
     .console { height: 100%; min-height: 0; border: 1px solid #202833; border-radius: 8px; overflow: hidden; background: #0d1117; }
     .console-head { display: flex; align-items: center; justify-content: space-between; height: 40px; padding: 0 12px; border-bottom: 1px solid #252d38; background: #151b23; color: #e5e7eb; font-size: 12px; font-weight: 750; }
     .console-head span:last-child { color: #93c5fd; }
     .log { height: calc(100% - 40px); overflow: auto; padding: 12px; color: #c9d1d9; font: 12px/1.55 Consolas, "Microsoft YaHei", monospace; white-space: pre-wrap; }
+    @media (max-width: 1100px) {
+      .app-shell { grid-template-columns: 178px minmax(0, 1fr); }
+      .workspace { grid-template-rows: 116px minmax(0, 1fr); }
+      .topbar { grid-template-columns: minmax(130px, 1fr) auto; grid-template-rows: auto auto; gap: 8px 12px; }
+      .tabs { grid-column: 1 / -1; grid-row: 2; }
+      .top-actions { grid-column: 2; grid-row: 1; }
+      .site-monitor-table { min-width: 720px; }
+      .site-monitor-table th:nth-child(7), .site-monitor-table td:nth-child(7) { display: none; }
+    }
     @media (max-width: 900px) {
       .app-shell { grid-template-columns: 178px minmax(0, 1fr); }
       .workspace { grid-template-rows: 116px minmax(0, 1fr); }
@@ -1796,6 +2667,9 @@ CONTROL_HTML = r"""<!doctype html>
       .summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }
       .price-view { grid-template-rows: auto auto auto 360px auto; overflow: auto; }
       .settings-layout { grid-template-columns: 1fr; }
+      .health-summary { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+      .site-monitor-toolbar { grid-template-columns: minmax(0, 1fr) repeat(2, minmax(130px, auto)); }
+      .notification-layout { grid-template-columns: 1fr; }
       .changes-view { overflow: auto; grid-template-rows: auto auto 420px auto; }
       .changes-toolbar { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     }
@@ -1818,8 +2692,11 @@ CONTROL_HTML = r"""<!doctype html>
       .brand-mark { width: 34px; height: 34px; }
       .brand-copy strong { font-size: 14px; }
       .side-label, .side-spacer, .side-status { display: none; }
-      .side-nav { grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 4px; }
+      .side-nav { display: flex; width: 100%; gap: 4px; overflow-x: auto; }
       .nav-item {
+        flex: 0 0 auto;
+        width: auto;
+        min-width: 88px;
         justify-content: center;
         gap: 4px;
         height: 36px;
@@ -1847,8 +2724,18 @@ CONTROL_HTML = r"""<!doctype html>
         overflow-x: auto;
       }
       .view-host { overflow: auto; }
-      .price-view, .site-view, .changes-view, .logs-view { padding: 10px; }
-      .summary, .category-strip, .filter-bar, .settings-grid, .changes-toolbar { grid-template-columns: minmax(0, 1fr); }
+      .price-view, .site-view, .changes-view, .notifications-view, .logs-view { padding: 10px; }
+      .summary, .category-strip, .filter-bar, .settings-grid, .changes-toolbar, .health-summary { grid-template-columns: minmax(0, 1fr); }
+      .site-monitor-toolbar { grid-template-columns: minmax(0, 1fr); }
+      .site-group-row { grid-template-columns: minmax(0, 1fr) minmax(80px, auto); }
+      .site-group-row span:nth-child(3), .site-group-row span:nth-child(4), .site-group-row span:nth-child(5) { display: none; }
+      .site-monitor-table { min-width: 340px; }
+      .site-monitor-table th, .site-monitor-table td { padding: 7px 6px; }
+      .site-monitor-table th:nth-child(4), .site-monitor-table td:nth-child(4),
+      .site-monitor-table th:nth-child(5), .site-monitor-table td:nth-child(5),
+      .site-monitor-table th:nth-child(6), .site-monitor-table td:nth-child(6) { display: none; }
+      .site-picker { grid-template-columns: minmax(0, 1fr); }
+      .site-count { white-space: normal; }
       .field-wide { grid-column: auto; }
       .section-head { flex-direction: column; align-items: flex-start; }
       .changes-view { grid-template-rows: auto auto minmax(360px, 1fr) auto; overflow: visible; }
@@ -1871,8 +2758,9 @@ CONTROL_HTML = r"""<!doctype html>
         <div class="side-label">工作区</div>
         <nav class="side-nav" aria-label="工作区导航">
           <button class="nav-item active" type="button" data-view="prices"><span class="nav-icon">¥</span>当前价格</button>
-          <button class="nav-item" type="button" data-view="sites"><span class="nav-icon">S</span>站点与授权</button>
-          <button class="nav-item" type="button" data-view="changes"><span class="nav-icon">Δ</span>价格变化<span class="nav-count" id="changeCountBadge" hidden>0</span></button>
+          <button class="nav-item" type="button" data-view="sites"><span class="nav-icon">S</span>站点监控</button>
+          <button class="nav-item" type="button" data-view="changes"><span class="nav-icon">Δ</span>变化记录<span class="nav-count" id="changeCountBadge" hidden>0</span></button>
+          <button class="nav-item" type="button" data-view="notifications"><span class="nav-icon">@</span>SMTP 通知</button>
           <button class="nav-item" type="button" data-view="logs"><span class="nav-icon">›_</span>运行日志</button>
         </nav>
       </div>
@@ -1891,13 +2779,13 @@ CONTROL_HTML = r"""<!doctype html>
     </aside>
 
     <main class="workspace">
-      <header class="topbar">
+      <header class="topbar" id="topbar">
         <div class="page-heading">
           <h1 id="viewTitle">当前价格</h1>
           <span id="snapshotTime">尚未生成价格快照</span>
         </div>
         <div class="tabs" id="categoryTabs"></div>
-        <div class="top-actions">
+        <div class="top-actions" id="priceActions">
           <button id="updateAllBtn" type="button" title="更新所有站点">↻ 更新全部</button>
           <button id="exportCsvBtn" type="button" title="导出 CSV" disabled>↓ CSV</button>
           <button id="exportJsonBtn" type="button" title="导出 JSON" disabled>↓ JSON</button>
@@ -1976,10 +2864,48 @@ CONTROL_HTML = r"""<!doctype html>
         <section class="view site-view" id="sitesView" hidden>
           <div class="section-head">
             <div>
-              <h2>站点与授权</h2>
-              <p>保存站点配置，登录后抓取当前套餐和分组倍率。</p>
+              <h2>站点监控</h2>
+              <p>查看健康状态、监控开关和最近检查结果。</p>
             </div>
           </div>
+
+          <div class="health-summary">
+            <div class="health-metric"><span>全部站点</span><strong id="siteTotalMetric">0</strong></div>
+            <div class="health-metric"><span>正常</span><strong id="siteOkMetric">0</strong></div>
+            <div class="health-metric"><span>观察中</span><strong id="siteWarningMetric">0</strong></div>
+            <div class="health-metric"><span>故障/需授权</span><strong id="siteFailedMetric">0</strong></div>
+            <div class="health-metric"><span>已停用</span><strong id="siteDisabledMetric">0</strong></div>
+            <div class="health-metric"><span>今日变化</span><strong id="siteTodayChangesMetric">0</strong></div>
+            <div class="health-metric"><span>未读变化</span><strong id="siteUnreadChangesMetric">0</strong></div>
+          </div>
+
+          <div class="site-monitor-toolbar">
+            <label>搜索站点<input id="siteMonitorSearchInput" type="search" spellcheck="false" placeholder="名称或地址" /></label>
+            <label>健康状态<select id="siteHealthFilterSelect"><option value="">全部</option><option value="ok">正常</option><option value="warning">观察中</option><option value="failed">连续失败</option><option value="needs_auth">需重新授权</option></select></label>
+            <label>监控状态<select id="siteEnabledFilterSelect"><option value="">全部</option><option value="enabled">已启用</option><option value="disabled">已停用</option></select></label>
+          </div>
+
+          <div class="site-table-wrap">
+            <table class="site-monitor-table">
+              <thead><tr><th>监控</th><th>站点</th><th>健康</th><th>连续失败</th><th>上次成功</th><th>下次检查</th><th>数据</th><th>操作</th></tr></thead>
+              <tbody id="siteMonitorBody"><tr><td colspan="8" class="empty">暂无已保存站点</td></tr></tbody>
+            </table>
+          </div>
+
+          <section class="site-detail" id="siteDetail" hidden>
+            <div class="site-detail-head">
+              <div><h3 id="siteDetailTitle">站点详情</h3><p id="siteDetailSubtitle"></p></div>
+              <div class="site-detail-actions"><button id="siteDetailChangesBtn" type="button" title="查看该站变化">≡</button><button id="siteDetailCheckBtn" type="button" title="立即检查当前站点">↻</button></div>
+            </div>
+            <div class="site-detail-stats" id="siteDetailStats"></div>
+            <div class="site-detail-error" id="siteDetailError" hidden></div>
+            <h4 class="site-detail-section-title">当前分组</h4>
+            <div class="site-groups" id="siteGroupDetails"></div>
+            <h4 class="site-detail-section-title">最近变化</h4>
+            <div class="site-recent-changes" id="siteRecentChanges"></div>
+            <h4 class="site-detail-section-title">最近检查</h4>
+            <div class="site-recent-changes" id="siteRecentChecks"></div>
+          </section>
 
           <div class="settings-layout">
             <section class="tool-panel">
@@ -2015,12 +2941,14 @@ CONTROL_HTML = r"""<!doctype html>
               <div class="action-grid">
                 <button id="saveSiteBtn" type="button">保存站点</button>
                 <button id="clearCredentialsBtn" type="button">清除密码</button>
+                <button id="testConnectionBtn" type="button">测试连接</button>
                 <button id="openSiteBtn" type="button" class="wide">打开 WebView 登录</button>
                 <button id="refreshLoginBtn" type="button">手动刷新验证页</button>
                 <button id="hideLoginBtn" type="button">暂时跳过本站</button>
                 <button id="captureBtn" type="button" class="primary wide">抓取当前价格</button>
                 <button id="deleteSiteBtn" type="button" class="danger wide">删除站点</button>
               </div>
+              <div class="connection-test-result" id="connectionTestResult" hidden></div>
             </section>
           </div>
         </section>
@@ -2028,8 +2956,8 @@ CONTROL_HTML = r"""<!doctype html>
         <section class="view changes-view" id="changesView" hidden>
           <div class="section-head">
             <div>
-              <h2>价格变化</h2>
-              <p>独立记录倍率、价格、分组和抓取状态变化，不会混入当前价格快照。</p>
+              <h2>变化记录</h2>
+              <p>倍率、价格、分组元数据和站点健康事件。</p>
             </div>
             <button id="acknowledgeChangesBtn" type="button">全部标记已读</button>
           </div>
@@ -2052,7 +2980,14 @@ CONTROL_HTML = r"""<!doctype html>
                 <option value="added">新增项目</option>
                 <option value="removed">移除项目</option>
                 <option value="details_changed">信息变化</option>
+                <option value="status_changed">分组状态</option>
+                <option value="is_exclusive_changed">专属属性</option>
+                <option value="subscription_type_changed">订阅类型</option>
+                <option value="rpm_limit_changed">RPM 限制</option>
+                <option value="platform_changed">平台变化</option>
                 <option value="site_error">抓取失败</option>
+                <option value="site_unhealthy">站点故障</option>
+                <option value="site_recovered">站点恢复</option>
               </select>
             </label>
             <label class="toggle">
@@ -2067,6 +3002,8 @@ CONTROL_HTML = r"""<!doctype html>
                 <tr>
                   <th>状态</th>
                   <th>类型</th>
+                  <th>级别</th>
+                  <th>方向</th>
                   <th>站点</th>
                   <th>项目</th>
                   <th>旧值</th>
@@ -2076,11 +3013,56 @@ CONTROL_HTML = r"""<!doctype html>
                 </tr>
               </thead>
               <tbody id="changesBody">
-                <tr><td colspan="8" class="empty">暂无变化记录</td></tr>
+                <tr><td colspan="10" class="empty">暂无变化记录</td></tr>
               </tbody>
             </table>
           </div>
           <div class="changes-footer"><span id="changesCountLabel">0 条变化</span></div>
+        </section>
+
+        <section class="view notifications-view" id="notificationsView" hidden>
+          <div class="section-head">
+            <div><h2>SMTP 通知</h2><p>监控变化通过邮件发送，密码由 Windows 凭据管理器保护。</p></div>
+          </div>
+          <div class="notification-layout">
+            <section class="tool-panel">
+              <h3>邮件服务器</h3>
+              <div class="settings-grid">
+                <label class="field-wide toggle"><input id="smtpEnabledInput" type="checkbox" />启用 SMTP 通知</label>
+                <label>服务器<input id="smtpHostInput" type="text" spellcheck="false" placeholder="smtp.example.com" /></label>
+                <label>端口<input id="smtpPortInput" type="number" min="1" max="65535" value="587" /></label>
+                <label>加密方式<select id="smtpSecurityInput"><option value="starttls">STARTTLS</option><option value="ssl">SSL/TLS</option><option value="none">无</option></select></label>
+                <label>用户名<input id="smtpUsernameInput" type="text" spellcheck="false" autocomplete="username" /></label>
+                <label>密码<input id="smtpPasswordInput" type="password" autocomplete="current-password" placeholder="留空则保留已保存密码" /></label>
+                <label>发件人<input id="smtpFromInput" type="email" spellcheck="false" /></label>
+                <label class="field-wide">收件人<textarea id="smtpRecipientsInput" spellcheck="false" placeholder="每行一个，或用逗号分隔"></textarea></label>
+                <label>主题前缀<input id="smtpSubjectPrefixInput" type="text" value="[Sub2API Monitor]" /></label>
+                <label>最低级别<select id="smtpMinSeverityInput"><option value="low">低及以上</option><option value="medium">中及以上</option><option value="high">仅高</option></select></label>
+              </div>
+              <div class="toggle-list" style="margin-top: 14px;">
+                <label class="toggle"><input id="smtpNotifyChangesInput" type="checkbox" checked />价格与分组变化</label>
+                <label class="toggle"><input id="smtpNotifyErrorsInput" type="checkbox" checked />抓取失败与站点故障</label>
+                <label class="toggle"><input id="smtpNotifyRecoveriesInput" type="checkbox" checked />站点恢复</label>
+              </div>
+              <div class="action-grid">
+                <button id="smtpSaveBtn" type="button" class="primary">保存设置</button>
+                <button id="smtpTestBtn" type="button">发送测试邮件</button>
+                <button id="smtpClearPasswordBtn" type="button" class="danger wide">清除 SMTP 密码</button>
+              </div>
+            </section>
+            <section class="tool-panel">
+              <h3>发送状态</h3>
+              <div class="smtp-status">
+                <div class="status-line"><span>通知</span><strong id="smtpEnabledStatus">未启用</strong></div>
+                <div class="status-line"><span>密码</span><strong id="smtpPasswordStatus">未保存</strong></div>
+                <div class="status-line"><span>最近发送</span><strong id="smtpLastSentStatus">—</strong></div>
+                <div class="status-line"><span>最近测试</span><strong id="smtpLastTestStatus">—</strong></div>
+                <div class="status-line"><span>最近错误</span><strong id="smtpLastErrorStatus">—</strong></div>
+              </div>
+              <h3 style="margin-top: 16px;">最近记录</h3>
+              <div class="notification-log" id="smtpLogList"><div class="empty">暂无发送记录</div></div>
+            </section>
+          </div>
         </section>
 
         <section class="view logs-view" id="logsView" hidden>
@@ -2147,14 +3129,63 @@ CONTROL_HTML = r"""<!doctype html>
     const changeTypeFilterSelect = document.querySelector('#changeTypeFilterSelect');
     const unreadOnlyInput = document.querySelector('#unreadOnlyInput');
     const acknowledgeChangesBtn = document.querySelector('#acknowledgeChangesBtn');
+    const siteMonitorBody = document.querySelector('#siteMonitorBody');
+    const siteMonitorSearchInput = document.querySelector('#siteMonitorSearchInput');
+    const siteHealthFilterSelect = document.querySelector('#siteHealthFilterSelect');
+    const siteEnabledFilterSelect = document.querySelector('#siteEnabledFilterSelect');
+    const siteTotalMetric = document.querySelector('#siteTotalMetric');
+    const siteOkMetric = document.querySelector('#siteOkMetric');
+    const siteWarningMetric = document.querySelector('#siteWarningMetric');
+    const siteFailedMetric = document.querySelector('#siteFailedMetric');
+    const siteDisabledMetric = document.querySelector('#siteDisabledMetric');
+    const siteTodayChangesMetric = document.querySelector('#siteTodayChangesMetric');
+    const siteUnreadChangesMetric = document.querySelector('#siteUnreadChangesMetric');
+    const siteDetail = document.querySelector('#siteDetail');
+    const siteDetailTitle = document.querySelector('#siteDetailTitle');
+    const siteDetailSubtitle = document.querySelector('#siteDetailSubtitle');
+    const siteDetailStats = document.querySelector('#siteDetailStats');
+    const siteDetailError = document.querySelector('#siteDetailError');
+    const siteGroupDetails = document.querySelector('#siteGroupDetails');
+    const siteRecentChanges = document.querySelector('#siteRecentChanges');
+    const siteRecentChecks = document.querySelector('#siteRecentChecks');
+    const siteDetailCheckBtn = document.querySelector('#siteDetailCheckBtn');
+    const siteDetailChangesBtn = document.querySelector('#siteDetailChangesBtn');
+    const testConnectionBtn = document.querySelector('#testConnectionBtn');
+    const connectionTestResult = document.querySelector('#connectionTestResult');
+    const smtpEnabledInput = document.querySelector('#smtpEnabledInput');
+    const smtpHostInput = document.querySelector('#smtpHostInput');
+    const smtpPortInput = document.querySelector('#smtpPortInput');
+    const smtpSecurityInput = document.querySelector('#smtpSecurityInput');
+    const smtpUsernameInput = document.querySelector('#smtpUsernameInput');
+    const smtpPasswordInput = document.querySelector('#smtpPasswordInput');
+    const smtpFromInput = document.querySelector('#smtpFromInput');
+    const smtpRecipientsInput = document.querySelector('#smtpRecipientsInput');
+    const smtpSubjectPrefixInput = document.querySelector('#smtpSubjectPrefixInput');
+    const smtpMinSeverityInput = document.querySelector('#smtpMinSeverityInput');
+    const smtpNotifyChangesInput = document.querySelector('#smtpNotifyChangesInput');
+    const smtpNotifyErrorsInput = document.querySelector('#smtpNotifyErrorsInput');
+    const smtpNotifyRecoveriesInput = document.querySelector('#smtpNotifyRecoveriesInput');
+    const smtpSaveBtn = document.querySelector('#smtpSaveBtn');
+    const smtpTestBtn = document.querySelector('#smtpTestBtn');
+    const smtpClearPasswordBtn = document.querySelector('#smtpClearPasswordBtn');
+    const smtpEnabledStatus = document.querySelector('#smtpEnabledStatus');
+    const smtpPasswordStatus = document.querySelector('#smtpPasswordStatus');
+    const smtpLastSentStatus = document.querySelector('#smtpLastSentStatus');
+    const smtpLastTestStatus = document.querySelector('#smtpLastTestStatus');
+    const smtpLastErrorStatus = document.querySelector('#smtpLastErrorStatus');
+    const smtpLogList = document.querySelector('#smtpLogList');
     const pricesView = document.querySelector('#pricesView');
     const sitesView = document.querySelector('#sitesView');
     const changesView = document.querySelector('#changesView');
+    const notificationsView = document.querySelector('#notificationsView');
     const logsView = document.querySelector('#logsView');
+    const topbar = document.querySelector('#topbar');
+    const priceActions = document.querySelector('#priceActions');
     const navItems = [...document.querySelectorAll('.nav-item[data-view]')];
     let rows = [];
     let savedSites = [];
     let changes = [];
+    let smtpState = {};
     let latestGeneratedAt = '';
     let stateRevision = 0;
     let activeCategory = '';
@@ -2167,15 +3198,19 @@ CONTROL_HTML = r"""<!doctype html>
     const PAGE_SIZE = 200;
     const MAX_LOG_LINES = 240;
     let loginAutoCaptureTimer = null;
+    let loginAutoCaptureKickoffTimer = null;
+    let loginAutoCaptureGeneration = 0;
     let loginAutoCaptureBusy = false;
     let loginAutoCaptureMode = '';
     let loginOpenBusy = false;
     let lastAutoCaptureError = '';
     let reauthQueue = [];
     let reauthActiveSite = '';
+    let reauthActiveRecord = null;
     let updateRunning = false;
     let observedUpdateId = 0;
     const deferredReauthSites = new Set();
+    const checkingSites = new Set();
     let noteTouched = false;
     let lastAutoNote = '';
     let activeView = 'prices';
@@ -2218,9 +3253,25 @@ CONTROL_HTML = r"""<!doctype html>
       consoleStatus.textContent = text;
     }
 
+    function advanceStateRevision(value) {
+      const next = Number(value) || 0;
+      if (next > stateRevision) stateRevision = next;
+      return stateRevision;
+    }
+
+    function acceptMutationResult(result) {
+      const incomingRevision = Number(result?.revision) || 0;
+      if (incomingRevision && incomingRevision < stateRevision) {
+        scheduleStatusPoll(0);
+        return false;
+      }
+      advanceStateRevision(incomingRevision);
+      return true;
+    }
+
     function setView(view) {
-      const views = { prices: pricesView, sites: sitesView, changes: changesView, logs: logsView };
-      const titles = { prices: '当前价格', sites: '站点与授权', changes: '价格变化', logs: '运行日志' };
+      const views = { prices: pricesView, sites: sitesView, changes: changesView, notifications: notificationsView, logs: logsView };
+      const titles = { prices: '当前价格', sites: '站点监控', changes: '变化记录', notifications: 'SMTP 通知', logs: '运行日志' };
       activeView = views[view] ? view : 'prices';
       for (const [name, element] of Object.entries(views)) {
         element.hidden = name !== activeView;
@@ -2228,9 +3279,15 @@ CONTROL_HTML = r"""<!doctype html>
       for (const button of navItems) {
         button.classList.toggle('active', button.dataset.view === activeView);
       }
+      const priceContext = activeView === 'prices';
+      categoryTabs.hidden = !priceContext;
+      priceActions.hidden = !priceContext;
+      topbar.classList.toggle('compact', !priceContext);
       viewTitle.textContent = titles[activeView];
       if (activeView === 'prices') render();
       if (activeView === 'changes') renderChanges();
+      if (activeView === 'sites') renderSiteMonitor();
+      if (activeView === 'notifications') renderSmtpState();
     }
 
     function categoryRank(category) {
@@ -2239,7 +3296,11 @@ CONTROL_HTML = r"""<!doctype html>
     }
 
     function numericPrice(row) {
-      const value = row.pay_price_cny || row.price;
+      const value = row.pay_price_cny !== null
+        && row.pay_price_cny !== undefined
+        && row.pay_price_cny !== ''
+        ? row.pay_price_cny
+        : row.price;
       const n = Number(value);
       return Number.isFinite(n) ? n : null;
     }
@@ -2317,11 +3378,18 @@ CONTROL_HTML = r"""<!doctype html>
         row.group_id,
         row.group_name,
         row.group_platform,
+        row.group_status,
+        row.subscription_type,
+        row.rpm_limit,
+        row.is_exclusive,
         row.plan_id,
         row.plan_name,
         row.price,
         row.pay_price_cny,
         row.rate_multiplier,
+        row.base_rate_multiplier,
+        row.user_rate_multiplier,
+        row.rate_source,
         row.description,
         row.error,
       ].map((value) => String(value ?? '').toLowerCase()).join(' ');
@@ -2456,6 +3524,250 @@ CONTROL_HTML = r"""<!doctype html>
       }).join('');
       if (savedSites.some((site) => site.site === selected)) savedSiteSelect.value = selected;
       siteCountLabel.textContent = `${savedSites.length} 个已保存站点`;
+      renderSiteMonitor();
+    }
+
+    function healthLabel(site) {
+      return site.health_label || ({
+        ok: '正常', warning: '异常观察中', failed: '连续失败', needs_auth: '需重新授权', unknown: '尚未检查',
+      })[site.health_status] || '尚未检查';
+    }
+
+    function rowsForSite(site) {
+      return rows.filter((row) => String(row.site || '') === String(site || ''));
+    }
+
+    function renderSiteDetail() {
+      const selectedSite = savedSiteSelect.value || siteInput.value;
+      const site = savedSites.find((item) => item.site === selectedSite);
+      if (!site) {
+        siteDetail.hidden = true;
+        siteDetailError.hidden = true;
+        return;
+      }
+      siteDetail.hidden = false;
+      const siteRows = rowsForSite(site.site);
+      const groupRows = siteRows.filter((row) => row.record_type === 'group');
+      const planRows = siteRows.filter((row) => row.record_type === 'plan');
+      siteDetailTitle.textContent = site.name || site.site;
+      siteDetailSubtitle.textContent = site.site;
+      const minRates = groupRows.map(numericRate).filter(Number.isFinite);
+      const minRate = minRates.length ? Math.min(...minRates) : null;
+      const coreStatus = site.last_core_status === 'ok' ? '核心抓取正常'
+        : site.last_core_status === 'partial' ? '核心抓取部分可用'
+        : site.last_core_status === 'error' ? '核心抓取失败' : '核心抓取未检查';
+      const enrichmentStatus = ({
+        complete: '用户倍率完整',
+        unsupported: '站点不支持用户倍率',
+        needs_auth: '用户倍率需授权',
+        degraded: '用户倍率暂不可用',
+        unknown: '用户倍率未验证',
+      })[site.last_enrichment_status] || '用户倍率未检查';
+      siteDetailStats.innerHTML = [
+        `<span class="health-badge ${escapeHtml(site.health_status || 'unknown')}">${escapeHtml(healthLabel(site))}</span>`,
+        `<span class="meta-badge">${escapeHtml(coreStatus)}</span>`,
+        `<span class="meta-badge user-rate">${escapeHtml(enrichmentStatus)}</span>`,
+        `<span class="meta-badge">${planRows.length || Number(site.last_plan_count) || 0} 套餐</span>`,
+        `<span class="meta-badge">${groupRows.length || Number(site.last_group_count) || 0} 分组</span>`,
+        `<span class="meta-badge exclusive">${Number(site.last_exclusive_count) || 0} 专属</span>`,
+        `<span class="meta-badge user-rate">${Number(site.last_user_rate_count) || 0} 用户倍率</span>`,
+        minRate === null ? '' : `<span class="meta-badge">最低倍率 ${escapeHtml(minRate)}</span>`,
+        `<span class="meta-badge">上次检查 ${escapeHtml(formatDateTime(site.last_run) || '—')}</span>`,
+        `<span class="meta-badge">上次成功 ${escapeHtml(formatDateTime(site.last_success_at) || '—')}</span>`,
+        `<span class="meta-badge">下次检查 ${escapeHtml(formatDateTime(site.next_run) || '—')}</span>`,
+        `<span class="meta-badge">连续失败 ${Number(site.consecutive_failures) || 0}</span>`,
+      ].filter(Boolean).join('');
+      siteDetailCheckBtn.dataset.site = site.site;
+      siteDetailCheckBtn.disabled = updateRunning;
+      siteDetailChangesBtn.dataset.site = site.site;
+      siteDetailError.hidden = !site.last_error;
+      siteDetailError.textContent = site.last_error || '';
+      const displayGroups = groupRows.slice().sort(compareRate).slice(0, 24);
+      siteGroupDetails.innerHTML = displayGroups.length ? displayGroups.map((row) => {
+        const effective = rateLabel(row);
+        const base = row.base_rate_multiplier ?? '—';
+        const user = row.user_rate_multiplier === null
+          || row.user_rate_multiplier === undefined
+          || row.user_rate_multiplier === ''
+          ? '—'
+          : row.user_rate_multiplier;
+        const source = row.rate_source === 'user_override'
+          ? '用户专属'
+          : row.rate_data_complete === false ? '基础（未验证）' : '基础';
+        const metadata = [
+          row.is_exclusive ? '专属' : '',
+          row.subscription_type || '',
+          row.group_status || '',
+        ].filter(Boolean).join(' · ') || '普通分组';
+        return `<div class="site-group-row">
+          <strong>${escapeHtml(row.group_name || row.group_id)}</strong>
+          <span>有效 ${escapeHtml(effective)}</span>
+          <span>基础 ${escapeHtml(base)}</span>
+          <span>用户 ${escapeHtml(user)}</span>
+          <span>${escapeHtml(source)} · RPM ${escapeHtml(row.rpm_limit ?? '—')} · ${escapeHtml(metadata)}</span>
+        </div>`;
+      }).join('') : '<div class="empty">当前快照没有分组数据</div>';
+      const recent = changes.filter((item) => (
+        item.site_key === site.site
+        || item.site === site.site
+        || (!item.site && item.site_host === new URL(site.site).host)
+      )).sort((a, b) => String(b.detected_at || '').localeCompare(String(a.detected_at || ''))).slice(0, 6);
+      siteRecentChanges.innerHTML = recent.length ? recent.map((item) => `
+        <div class="site-recent-change">
+          <span class="change-kind ${escapeHtml(item.change_type)}">${escapeHtml(changeTypeLabel(item.change_type))}</span>
+          <span>${escapeHtml(item.message || item.item_label || '')}</span>
+          <span>${escapeHtml(formatDateTime(item.detected_at) || '—')}</span>
+        </div>`).join('') : '<div class="empty">暂无该站变化</div>';
+      const recentChecks = Array.isArray(site.check_history) ? site.check_history.slice(0, 6) : [];
+      siteRecentChecks.innerHTML = recentChecks.length ? recentChecks.map((item) => `
+        <div class="site-recent-change">
+          <span class="health-badge ${escapeHtml(item.health_status || 'unknown')}">${escapeHtml(item.status_label || item.status || '未知')}</span>
+          <span>${Number(item.row_count) || 0} 行 · ${Number(item.plan_count) || 0} 套餐 · ${Number(item.group_count) || 0} 分组${item.error_code ? ` · ${escapeHtml(item.error_code)}` : ''}</span>
+          <span>${escapeHtml(formatDateTime(item.checked_at) || '—')}</span>
+        </div>`).join('') : '<div class="empty">暂无检查历史</div>';
+    }
+
+    function renderSiteMonitor() {
+      const healthCounts = { ok: 0, warning: 0, failed: 0, needs_auth: 0 };
+      const enabledSites = savedSites.filter((site) => site.auto_refresh !== false);
+      for (const site of enabledSites) {
+        if (healthCounts[site.health_status] !== undefined) healthCounts[site.health_status] += 1;
+      }
+      siteTotalMetric.textContent = String(savedSites.length);
+      siteOkMetric.textContent = String(healthCounts.ok);
+      siteWarningMetric.textContent = String(healthCounts.warning);
+      siteFailedMetric.textContent = String(healthCounts.failed + healthCounts.needs_auth);
+      siteDisabledMetric.textContent = String(savedSites.filter((site) => site.auto_refresh === false).length);
+      const today = new Date();
+      today.setHours(0, 0, 0, 0);
+      siteTodayChangesMetric.textContent = String(changes.filter((item) => {
+        const detected = new Date(item.detected_at || 0);
+        return !Number.isNaN(detected.getTime()) && detected >= today;
+      }).length);
+      siteUnreadChangesMetric.textContent = String(changes.filter((item) => !item.acknowledged).length);
+      if (!savedSites.length) {
+        siteMonitorBody.innerHTML = '<tr><td colspan="8" class="empty">暂无已保存站点</td></tr>';
+        renderSiteDetail();
+        return;
+      }
+      const query = siteMonitorSearchInput.value.trim().toLowerCase();
+      const healthFilter = siteHealthFilterSelect.value;
+      const enabledFilter = siteEnabledFilterSelect.value;
+      const displaySites = savedSites.filter((site) => {
+        if (query && !`${site.name || ''} ${site.site || ''}`.toLowerCase().includes(query)) return false;
+        if (healthFilter && site.health_status !== healthFilter) return false;
+        if (enabledFilter === 'enabled' && site.auto_refresh === false) return false;
+        if (enabledFilter === 'disabled' && site.auto_refresh !== false) return false;
+        return true;
+      });
+      if (!displaySites.length) {
+        siteMonitorBody.innerHTML = '<tr><td colspan="8" class="empty">没有符合筛选条件的站点</td></tr>';
+        renderSiteDetail();
+        return;
+      }
+      siteMonitorBody.innerHTML = displaySites.map((site) => {
+        const checking = checkingSites.has(site.site);
+        const dataText = `${Number(site.last_plan_count) || 0} 套餐 · ${Number(site.last_group_count) || 0} 分组 · ${Number(site.last_user_rate_count) || 0} 用户倍率`;
+        return `<tr>
+          <td><input class="site-monitor-toggle" type="checkbox" data-site="${escapeHtml(site.site)}" ${site.auto_refresh === false ? '' : 'checked'} aria-label="切换站点自动检查" /></td>
+          <td><button class="site-name-button" type="button" data-site="${escapeHtml(site.site)}"><strong>${escapeHtml(site.name || site.site)}</strong><small>${escapeHtml(site.site)}</small></button></td>
+          <td><span class="health-badge ${escapeHtml(site.health_status || 'unknown')}">${escapeHtml(healthLabel(site))}</span></td>
+          <td>${Number(site.consecutive_failures) || 0}</td>
+          <td>${escapeHtml(formatDateTime(site.last_success_at) || '—')}</td>
+          <td>${escapeHtml(formatDateTime(site.next_run) || '—')}</td>
+          <td>${escapeHtml(dataText)}</td>
+          <td><div class="site-row-actions"><button class="site-check-button${checking ? ' checking' : ''}" type="button" data-site="${escapeHtml(site.site)}" title="立即检查" ${updateRunning ? 'disabled' : ''}>↻</button></div></td>
+        </tr>`;
+      }).join('');
+      for (const input of siteMonitorBody.querySelectorAll('.site-monitor-toggle')) {
+        input.addEventListener('change', () => setSiteMonitoring(input.dataset.site, input.checked));
+      }
+      for (const button of siteMonitorBody.querySelectorAll('.site-name-button')) {
+        button.addEventListener('click', () => {
+          const site = savedSites.find((item) => item.site === button.dataset.site);
+          if (!site) return;
+          savedSiteSelect.value = site.site;
+          applySavedSite(site);
+          renderSiteDetail();
+        });
+      }
+      for (const button of siteMonitorBody.querySelectorAll('.site-check-button')) {
+        button.addEventListener('click', () => startSingleSiteCheck(button.dataset.site));
+      }
+      renderSiteDetail();
+    }
+
+    async function setSiteMonitoring(site, enabled) {
+      const result = await window.pywebview.api.set_site_monitoring(site, enabled);
+      if (!result.ok) {
+        log(result.error);
+        renderSiteMonitor();
+        return;
+      }
+      if (!acceptMutationResult(result)) return;
+      savedSites = result.saved_sites || savedSites;
+      if (!enabled) {
+        deferredReauthSites.delete(site);
+        reauthQueue = reauthQueue.filter((item) => item.site !== site);
+        if (reauthActiveSite === site) {
+          stopLoginAutoCapture();
+          await window.pywebview.api.hide_login_webview();
+          reauthActiveSite = '';
+          reauthActiveRecord = null;
+          setTimeout(startNextReauth, 0);
+        }
+      }
+      renderSavedSites();
+      log(`${enabled ? '已启用' : '已停用'}自动检查：${site}`);
+    }
+
+    async function startSingleSiteCheck(site) {
+      if (!site || updateRunning) return;
+      checkingSites.add(site);
+      renderSiteMonitor();
+      const result = await window.pywebview.api.start_site_check(site);
+      if (!result.ok || !result.accepted) {
+        checkingSites.delete(site);
+        renderSiteMonitor();
+        log(result.error || result.message || '无法启动单站检查');
+        return;
+      }
+      log(`开始立即检查：${site}`);
+      scheduleStatusPoll(250);
+    }
+
+    async function testSiteConnection() {
+      const site = siteInput.value.trim();
+      if (!site) {
+        log('请先输入站点地址');
+        return;
+      }
+      testConnectionBtn.disabled = true;
+      connectionTestResult.hidden = false;
+      connectionTestResult.textContent = '正在测试连接…';
+      try {
+        const result = await window.pywebview.api.test_site_connection(
+          site,
+          apiBaseInput.value,
+          includeGroupsInput.checked
+        );
+        const counts = `${Number(result.plan_count) || 0} 套餐 · ${Number(result.group_count) || 0} 分组 · ${Number(result.user_rate_count) || 0} 用户倍率`;
+        const sources = Array.isArray(result.sources) && result.sources.length
+          ? ` · ${result.sources.join(', ')}`
+          : '';
+        if (result.auth_required) {
+          connectionTestResult.textContent = `${result.status_label || '需重新授权'} · ${result.error || counts}`;
+        } else if (!result.ok) {
+          connectionTestResult.textContent = `连接失败 · ${result.error || result.status_label || '未知错误'}`;
+        } else if (result.partial) {
+          connectionTestResult.textContent = `核心接口可用，增强数据部分失败 · ${counts}${sources} · ${result.error || ''}`;
+        } else {
+          connectionTestResult.textContent = `连接正常 · ${counts}${sources}`;
+        }
+        log(`连接测试：${connectionTestResult.textContent}`);
+      } finally {
+        testConnectionBtn.disabled = false;
+      }
     }
 
     function render() {
@@ -2504,17 +3816,26 @@ CONTROL_HTML = r"""<!doctype html>
           htmlRows.push(`<tr class="subgroup-row"><td colspan="10">${escapeHtml(candidateLabel(row))}</td></tr>`);
         }
         const validity = [row.validity_days, row.validity_unit].filter(Boolean).join(' ');
+        const rowStatus = row.status === 'partial'
+          ? `<small>${escapeHtml(row.status_label || '部分接口异常')}</small>`
+          : '';
         htmlRows.push(`<tr>
-          <td>${escapeHtml(recordTypeLabel(row.record_type))}</td>
+          <td>${escapeHtml(recordTypeLabel(row.record_type))}${rowStatus}</td>
           <td>${escapeHtml(row.site_host || row.site)}</td>
           <td><span class="category-badge">${escapeHtml(category)}</span><small>${escapeHtml(row.model_names)}</small></td>
-          <td>${escapeHtml(row.group_name || row.group_id)}</td>
+          <td>${escapeHtml(row.group_name || row.group_id)}<small>${escapeHtml([
+            row.is_exclusive ? '专属' : '', row.subscription_type, row.group_status, row.rpm_limit ? `RPM ${row.rpm_limit}` : '',
+          ].filter(Boolean).join(' · '))}</small></td>
           <td>${escapeHtml(row.group_platform)}</td>
           <td>${escapeHtml(row.plan_name || row.description)}</td>
           <td>${escapeHtml(row.price)}</td>
           <td>${escapeHtml(row.pay_price_cny)}</td>
           <td>${escapeHtml(validity)}</td>
-          <td>${escapeHtml(row.rate_multiplier)}</td>
+          <td>${escapeHtml(row.rate_multiplier)}<small>${escapeHtml([
+            row.base_rate_multiplier !== null && row.base_rate_multiplier !== undefined ? `基础 ${row.base_rate_multiplier}` : '',
+            row.user_rate_multiplier !== null && row.user_rate_multiplier !== undefined && row.user_rate_multiplier !== '' ? `用户 ${row.user_rate_multiplier}` : '',
+            row.rate_source === 'user_override' ? '用户专属' : row.rate_data_complete === false ? '基础回退 · 未验证' : '',
+          ].filter(Boolean).join(' · '))}</small></td>
         </tr>`);
       }
       resultBody.innerHTML = htmlRows.join('');
@@ -2527,8 +3848,26 @@ CONTROL_HTML = r"""<!doctype html>
         added: '新增项目',
         removed: '移除项目',
         details_changed: '信息变化',
+        status_changed: '分组状态',
+        is_exclusive_changed: '专属属性',
+        subscription_type_changed: '订阅类型',
+        rpm_limit_changed: 'RPM 限制',
+        platform_changed: '平台变化',
         site_error: '抓取失败',
+        site_unhealthy: '站点故障',
+        site_recovered: '站点恢复',
       })[type] || type || '变化';
+    }
+
+    function severityLabel(value) {
+      return ({ low: '低', medium: '中', high: '高' })[value] || '低';
+    }
+
+    function directionLabel(value) {
+      return ({
+        increase: '上涨', decrease: '下降', added: '新增', removed: '移除',
+        degraded: '恶化', recovered: '恢复', changed: '变更',
+      })[value] || '变更';
     }
 
     function compactChangeValue(value) {
@@ -2536,11 +3875,17 @@ CONTROL_HTML = r"""<!doctype html>
       if (typeof value !== 'object') return String(value);
       const parts = [
         ['倍率', value.rate_multiplier],
+        ['基础倍率', value.base_rate_multiplier],
+        ['用户倍率', value.user_rate_multiplier],
         ['CNY', value.pay_price_cny],
         ['价格', value.price],
         ['状态', value.status],
         ['分组', value.group_name],
         ['平台', value.group_platform],
+        ['分组状态', value.group_status],
+        ['专属', value.is_exclusive],
+        ['订阅类型', value.subscription_type],
+        ['RPM', value.rpm_limit],
         ['套餐', value.plan_name],
         ['有效期', value.validity_days],
         ['高峰倍率', value.peak_rate_multiplier],
@@ -2562,7 +3907,7 @@ CONTROL_HTML = r"""<!doctype html>
 
     function renderChangeSiteOptions() {
       const selected = changeSiteFilterSelect.value;
-      const sites = [...new Set(changes.map((item) => item.site_host || item.site).filter(Boolean))]
+      const sites = [...new Set(changes.map((item) => item.site_key || item.site || item.site_host).filter(Boolean))]
         .sort((a, b) => a.localeCompare(b, 'zh-CN'));
       changeSiteFilterSelect.innerHTML = '<option value="">全部站点</option>' + sites.map((site) => (
         `<option value="${escapeHtml(site)}">${escapeHtml(site)}</option>`
@@ -2575,7 +3920,7 @@ CONTROL_HTML = r"""<!doctype html>
       const site = changeSiteFilterSelect.value;
       const type = changeTypeFilterSelect.value;
       return changes.filter((item) => {
-        if (site && (item.site_host || item.site) !== site) return false;
+        if (site && (item.site_key || item.site || item.site_host) !== site) return false;
         if (type && item.change_type !== type) return false;
         if (unreadOnlyInput.checked && item.acknowledged) return false;
         if (query) {
@@ -2600,11 +3945,11 @@ CONTROL_HTML = r"""<!doctype html>
       const displayChanges = getFilteredChanges();
       changesCountLabel.textContent = `${displayChanges.length}/${changes.length} 条变化`;
       if (!changes.length) {
-        changesBody.innerHTML = '<tr><td colspan="8" class="empty">暂无变化记录</td></tr>';
+        changesBody.innerHTML = '<tr><td colspan="10" class="empty">暂无变化记录</td></tr>';
         return;
       }
       if (!displayChanges.length) {
-        changesBody.innerHTML = '<tr><td colspan="8" class="empty">没有符合筛选条件的变化</td></tr>';
+        changesBody.innerHTML = '<tr><td colspan="10" class="empty">没有符合筛选条件的变化</td></tr>';
         return;
       }
       changesBody.innerHTML = displayChanges.map((item) => {
@@ -2618,6 +3963,8 @@ CONTROL_HTML = r"""<!doctype html>
         return `<tr${unreadClass}>
           <td>${item.acknowledged ? '已读' : '未读'}</td>
           <td><span class="change-kind ${escapeHtml(item.change_type)}">${escapeHtml(changeTypeLabel(item.change_type))}</span></td>
+          <td><span class="severity-badge ${escapeHtml(item.severity || 'low')}">${escapeHtml(severityLabel(item.severity))}</span></td>
+          <td><span class="direction-badge ${escapeHtml(item.direction || 'changed')}">${escapeHtml(directionLabel(item.direction))}</span></td>
           <td>${escapeHtml(item.site_host || item.site)}</td>
           <td>${escapeHtml(item.item_label)}<small>${escapeHtml(item.message)}</small></td>
           <td class="change-value">${escapeHtml(compactChangeValue(item.old_value))}</td>
@@ -2626,6 +3973,106 @@ CONTROL_HTML = r"""<!doctype html>
           <td>${escapeHtml(formatDateTime(item.detected_at))}</td>
         </tr>`;
       }).join('');
+    }
+
+    function applySmtpState(state, updateForm = false) {
+      smtpState = state || {};
+      if (updateForm) {
+        smtpEnabledInput.checked = Boolean(smtpState.enabled);
+        smtpHostInput.value = smtpState.host || '';
+        smtpPortInput.value = String(smtpState.port || 587);
+        smtpSecurityInput.value = smtpState.security || 'starttls';
+        smtpUsernameInput.value = smtpState.username || '';
+        smtpFromInput.value = smtpState.from_address || '';
+        smtpRecipientsInput.value = (smtpState.recipients || []).join('\n');
+        smtpSubjectPrefixInput.value = smtpState.subject_prefix || '[Sub2API Monitor]';
+        smtpMinSeverityInput.value = smtpState.min_severity || 'low';
+        smtpNotifyChangesInput.checked = smtpState.notify_changes !== false;
+        smtpNotifyErrorsInput.checked = smtpState.notify_site_errors !== false;
+        smtpNotifyRecoveriesInput.checked = smtpState.notify_recoveries !== false;
+        smtpPasswordInput.value = '';
+      }
+      renderSmtpState();
+    }
+
+    function renderSmtpState() {
+      smtpEnabledStatus.textContent = smtpState.enabled ? '已启用' : '未启用';
+      smtpPasswordStatus.textContent = smtpState.has_password ? '已安全保存' : '未保存';
+      smtpLastSentStatus.textContent = formatDateTime(smtpState.last_sent_at) || '—';
+      smtpLastTestStatus.textContent = formatDateTime(smtpState.last_test_at) || '—';
+      smtpLastErrorStatus.textContent = smtpState.last_error || '—';
+      const logs = Array.isArray(smtpState.logs) ? smtpState.logs : [];
+      smtpLogList.innerHTML = logs.length ? logs.map((item) => `
+        <div class="notification-log-row">
+          <strong>${item.status === 'sent' ? '已发送' : '发送失败'} · ${escapeHtml(formatDateTime(item.sent_at) || '')}</strong>
+          <span>${escapeHtml(item.subject || '')} · ${escapeHtml(item.target || '')}${item.event_count ? ` · ${escapeHtml(item.event_count)} 条` : ''}</span>
+          ${item.error ? `<span>${escapeHtml(item.error)}</span>` : ''}
+        </div>`).join('') : '<div class="empty">暂无发送记录</div>';
+    }
+
+    async function saveSmtpSettings(silent = false) {
+      smtpSaveBtn.disabled = true;
+      try {
+        const result = await window.pywebview.api.save_smtp_settings(
+          smtpEnabledInput.checked,
+          smtpHostInput.value,
+          smtpPortInput.value,
+          smtpSecurityInput.value,
+          smtpUsernameInput.value,
+          smtpFromInput.value,
+          smtpRecipientsInput.value,
+          smtpSubjectPrefixInput.value,
+          smtpMinSeverityInput.value,
+          smtpNotifyChangesInput.checked,
+          smtpNotifyErrorsInput.checked,
+          smtpNotifyRecoveriesInput.checked,
+          smtpPasswordInput.value
+        );
+        if (!result.ok) {
+          log(result.error);
+          return false;
+        }
+        if (!acceptMutationResult(result)) return false;
+        applySmtpState(result.smtp, true);
+        if (!silent) log('SMTP 通知设置已保存');
+        return true;
+      } finally {
+        smtpSaveBtn.disabled = false;
+      }
+    }
+
+    async function testSmtpNotification() {
+      smtpTestBtn.disabled = true;
+      try {
+        if (!await saveSmtpSettings(true)) return;
+        const result = await window.pywebview.api.test_smtp_notification();
+        const freshResult = acceptMutationResult(result);
+        if (freshResult && result.smtp) applySmtpState(result.smtp, false);
+        if (!result.ok) {
+          log(`SMTP 测试失败：${result.error}`);
+          return;
+        }
+        log('SMTP 测试邮件已发送');
+      } finally {
+        smtpTestBtn.disabled = false;
+      }
+    }
+
+    async function clearSmtpPassword() {
+      smtpClearPasswordBtn.disabled = true;
+      try {
+        const result = await window.pywebview.api.clear_smtp_password();
+        if (!result.ok) {
+          log(result.error);
+          return;
+        }
+        if (!acceptMutationResult(result)) return;
+        smtpPasswordInput.value = '';
+        applySmtpState(result.smtp, true);
+        log(result.deleted ? 'SMTP 密码已清除' : '没有已保存的 SMTP 密码');
+      } finally {
+        smtpClearPasswordBtn.disabled = false;
+      }
     }
 
     function applySavedSite(site) {
@@ -2637,6 +4084,7 @@ CONTROL_HTML = r"""<!doctype html>
       apiBaseInput.value = site.api_base || '/api/v1';
       intervalHoursInput.value = site.interval_minutes ? String(Math.round(site.interval_minutes / 60 * 100) / 100) : '3';
       autoRefreshInput.checked = site.auto_refresh !== false;
+      includeGroupsInput.checked = site.include_groups !== false;
       rememberCredentialsInput.checked = site.remember_credentials !== false;
       autoLoginInput.checked = site.auto_login !== false && rememberCredentialsInput.checked;
     }
@@ -2659,15 +4107,16 @@ CONTROL_HTML = r"""<!doctype html>
         intervalHoursInput.value,
         rememberCredentialsInput.checked,
         autoLoginInput.checked,
-        autoRefreshInput.checked
+        autoRefreshInput.checked,
+        includeGroupsInput.checked
       );
       if (!result.ok) {
         log(result.error);
         return;
       }
+      if (!acceptMutationResult(result)) return;
       savedSites = result.saved_sites || [];
       if (Array.isArray(result.changes)) changes = result.changes;
-      stateRevision = Number(result.revision) || stateRevision;
       renderSavedSites();
       savedSiteSelect.value = result.site;
       const saved = savedSites.find((item) => item.site === result.site);
@@ -2676,20 +4125,41 @@ CONTROL_HTML = r"""<!doctype html>
     }
 
     async function deleteSite() {
-      const result = await window.pywebview.api.delete_site(siteInput.value || savedSiteSelect.value);
+      const enteredSite = siteInput.value.trim();
+      const selectedSite = savedSiteSelect.value;
+      const targetSite = enteredSite || selectedSite;
+      if (!targetSite) {
+        log('请先选择要删除的站点');
+        return;
+      }
+      const record = savedSites.find((item) => item.site === targetSite);
+      if (!record) {
+        log('当前地址不是已保存站点，未执行删除');
+        return;
+      }
+      if (!window.confirm(`确认删除站点“${record.name || record.site}”及其历史数据？`)) return;
+      const result = await window.pywebview.api.delete_site(targetSite);
       if (!result.ok) {
         log(result.error);
         return;
       }
+      if (!acceptMutationResult(result)) return;
       savedSites = result.saved_sites || [];
-      stateRevision = Number(result.revision) || stateRevision;
+      rows = result.rows || rows;
+      changes = result.changes || [];
+      latestGeneratedAt = result.generated_at || latestGeneratedAt;
       reauthQueue = reauthQueue.filter((item) => item.site !== result.site);
       if (reauthActiveSite === result.site) {
         stopLoginAutoCapture();
         reauthActiveSite = '';
+        reauthActiveRecord = null;
         setTimeout(startNextReauth, 0);
       }
       renderSavedSites();
+      savedSiteSelect.value = '';
+      siteInput.value = '';
+      siteNameInput.value = '';
+      render();
       renderChanges();
       log(result.credentials_deleted
         ? `已删除站点及其保存密码：${result.site}`
@@ -2703,17 +4173,22 @@ CONTROL_HTML = r"""<!doctype html>
         log(result.error);
         return;
       }
+      if (!acceptMutationResult(result)) return;
       savedSites = result.saved_sites || savedSites;
-      stateRevision = Number(result.revision) || stateRevision;
       renderSavedSites();
       savedSiteSelect.value = result.site;
       log(result.deleted ? `已清除站点密码：${result.site}` : `该站点没有已保存密码：${result.site}`);
     }
 
     function stopLoginAutoCapture() {
+      loginAutoCaptureGeneration += 1;
       if (loginAutoCaptureTimer) {
         clearInterval(loginAutoCaptureTimer);
         loginAutoCaptureTimer = null;
+      }
+      if (loginAutoCaptureKickoffTimer) {
+        clearTimeout(loginAutoCaptureKickoffTimer);
+        loginAutoCaptureKickoffTimer = null;
       }
       loginAutoCaptureBusy = false;
       loginAutoCaptureMode = '';
@@ -2754,15 +4229,44 @@ CONTROL_HTML = r"""<!doctype html>
       }
     }
 
-    function finishActiveReauth() {
-      if (!reauthActiveSite) return;
+    function finishActiveReauth(completedSite) {
+      if (!reauthActiveSite || completedSite !== reauthActiveSite) return false;
       const completed = reauthActiveSite;
       reauthActiveSite = '';
+      reauthActiveRecord = null;
+      deferredReauthSites.delete(completed);
       log(`重新授权完成：${completed}`);
       setTimeout(startNextReauth, 500);
+      return true;
+    }
+
+    function suspendActiveReauth(nextSite) {
+      if (!reauthActiveSite || reauthActiveSite === nextSite) return;
+      const record = reauthActiveRecord
+        || savedSites.find((item) => item.site === reauthActiveSite)
+        || { site: reauthActiveSite };
+      stopLoginAutoCapture();
+      if (!deferredReauthSites.has(record.site)
+          && !reauthQueue.some((item) => item.site === record.site)) {
+        reauthQueue.unshift(record);
+      }
+      log(`重新授权已排回队列：${reauthLabel(record)}`);
+      reauthActiveSite = '';
+      reauthActiveRecord = null;
     }
 
     function enqueueReauthSites(sites) {
+      const requiredSites = new Set((sites || []).map((record) => record?.site).filter(Boolean));
+      reauthQueue = reauthQueue.filter((record) => requiredSites.has(record.site));
+      if (reauthActiveSite && !requiredSites.has(reauthActiveSite)) {
+        stopLoginAutoCapture();
+        reauthActiveSite = '';
+        reauthActiveRecord = null;
+        Promise.resolve()
+          .then(() => window.pywebview.api.hide_login_webview())
+          .catch(() => {})
+          .finally(() => setTimeout(startNextReauth, 0));
+      }
       for (const record of sites || []) {
         if (!record?.site || record.site === reauthActiveSite) continue;
         if (deferredReauthSites.has(record.site)) continue;
@@ -2779,15 +4283,14 @@ CONTROL_HTML = r"""<!doctype html>
       if (updateRunning || reauthActiveSite || loginAutoCaptureTimer || !reauthQueue.length) return;
       const record = reauthQueue.shift();
       reauthActiveSite = record.site;
-      const saved = savedSites.find((item) => item.site === record.site) || record;
-      applySavedSite(saved);
-      savedSiteSelect.value = record.site;
+      reauthActiveRecord = record;
       setState('需要重新授权');
       log(`正在打开重新授权窗口：${reauthLabel(record)}`);
       const result = await requestLoginWindow(record.site);
       if (!result.ok) {
         log(`重新授权窗口打开失败：${result.error}`);
         reauthActiveSite = '';
+        reauthActiveRecord = null;
         if (result.update_running) {
           reauthQueue.unshift(record);
           setTimeout(startNextReauth, 1000);
@@ -2807,16 +4310,23 @@ CONTROL_HTML = r"""<!doctype html>
       startLoginAutoCapture('reauth');
     }
 
-    async function tryLoginAutoCapture() {
-      if (loginAutoCaptureBusy) return;
+    async function tryLoginAutoCapture(generation = loginAutoCaptureGeneration) {
+      if (generation !== loginAutoCaptureGeneration || loginAutoCaptureBusy) return;
       loginAutoCaptureBusy = true;
       try {
         const mode = loginAutoCaptureMode;
-        const ok = await capture({ auto: true });
-        if (ok) {
+        const activeRecord = reauthActiveRecord;
+        const captureResult = await capture({
+          auto: true,
+          apiBase: activeRecord?.api_base,
+          includeGroups: activeRecord?.include_groups,
+          expectedSite: reauthActiveSite || siteInput.value.trim(),
+        });
+        if (generation !== loginAutoCaptureGeneration) return;
+        if (captureResult) {
           stopLoginAutoCapture();
           if (mode === 'reauth') {
-            finishActiveReauth();
+            finishActiveReauth(captureResult.site);
           } else {
             log('已自动抓取价格并收起 WebView 登录窗口');
             setTimeout(startNextReauth, 500);
@@ -2830,17 +4340,24 @@ CONTROL_HTML = r"""<!doctype html>
     function startLoginAutoCapture(mode = 'login') {
       stopLoginAutoCapture();
       loginAutoCaptureMode = mode;
+      const generation = loginAutoCaptureGeneration;
       log(mode === 'reauth'
         ? '已启动重新授权检测：登录恢复后会自动抓取。'
         : '已启动登录后自动抓取：完成登录后会自动抓取价格并收起 WebView 窗口。');
-      loginAutoCaptureTimer = setInterval(tryLoginAutoCapture, 5000);
-      setTimeout(tryLoginAutoCapture, 1500);
+      loginAutoCaptureTimer = setInterval(() => tryLoginAutoCapture(generation), 5000);
+      loginAutoCaptureKickoffTimer = setTimeout(() => {
+        loginAutoCaptureKickoffTimer = null;
+        tryLoginAutoCapture(generation);
+      }, 1500);
     }
 
     async function openSite() {
-      const result = await requestLoginWindow(siteInput.value);
+      const requestedSite = siteInput.value.trim();
+      suspendActiveReauth(requestedSite);
+      const result = await requestLoginWindow(requestedSite);
       if (!result.ok) {
         log(result.error);
+        setTimeout(startNextReauth, 500);
         return;
       }
       siteInput.value = result.site;
@@ -2849,6 +4366,9 @@ CONTROL_HTML = r"""<!doctype html>
       setState('WebView 登录中');
       log(`已在 WebView 打开：${result.site}`);
       log('请在目标站点窗口完成登录；登录态可用后应用会自动抓取并收起该窗口。');
+      if (reauthActiveSite === result.site && !reauthActiveRecord) {
+        reauthActiveRecord = savedSites.find((item) => item.site === result.site) || { site: result.site };
+      }
       startLoginAutoCapture(reauthActiveSite === result.site ? 'reauth' : 'login');
     }
 
@@ -2887,8 +4407,9 @@ CONTROL_HTML = r"""<!doctype html>
           reauthQueue = reauthQueue.filter((item) => item.site !== skippedSite);
           log(`本轮已暂时跳过：${skippedSite}`);
         }
-        if (reauthActiveSite) {
+        if (reauthActiveSite && reauthActiveSite === skippedSite) {
           reauthActiveSite = '';
+          reauthActiveRecord = null;
           setTimeout(startNextReauth, 500);
         }
         setState('已暂时跳过本站');
@@ -2900,14 +4421,17 @@ CONTROL_HTML = r"""<!doctype html>
 
     async function capture(options = {}) {
       const auto = Boolean(options.auto);
+      const expectedSite = String(options.expectedSite || siteInput.value || '').trim();
+      const captureApiBase = options.apiBase ?? apiBaseInput.value;
+      const captureIncludeGroups = options.includeGroups ?? includeGroupsInput.checked;
       if (!auto) stopLoginAutoCapture();
       captureBtn.disabled = true;
       setState(auto ? '等待登录完成' : 'WebView 抓取中');
       if (!auto) log('开始从 WebView 当前登录页抓取价格接口');
       try {
         const started = await window.pywebview.api.start_capture_prices(
-          apiBaseInput.value,
-          includeGroupsInput.checked,
+          captureApiBase,
+          captureIncludeGroups,
           true
         );
         let result = started;
@@ -2926,7 +4450,11 @@ CONTROL_HTML = r"""<!doctype html>
             }
           }
         }
-        if (!result.ok) {
+        if (result.site && expectedSite && result.site !== expectedSite) {
+          log(`忽略已过期的抓取结果：${result.site}`);
+          return false;
+        }
+        if (!result.ok || result.auth_required) {
           if (auto) {
             if (['cloudflare_challenge', 'timeout', 'network_error'].includes(result.error_code)) {
               stopLoginAutoCapture();
@@ -2943,6 +4471,7 @@ CONTROL_HTML = r"""<!doctype html>
               if (reauthActiveSite) {
                 reauthQueue = reauthQueue.filter((item) => item.site !== reauthActiveSite);
                 reauthActiveSite = '';
+                reauthActiveRecord = null;
               }
               setState(result.status_label || '登录窗口已关闭');
               log(`${result.status_label || '自动抓取已暂停'}：本站在本轮已暂时跳过。`);
@@ -2960,25 +4489,27 @@ CONTROL_HTML = r"""<!doctype html>
           }
           return false;
         }
-        rows = result.rows || [];
-        savedSites = result.saved_sites || savedSites;
-        if (Array.isArray(result.changes)) changes = result.changes;
-        latestGeneratedAt = result.generated_at || latestGeneratedAt;
-        stateRevision = Number(result.revision) || stateRevision;
-        currentPage = 0;
-        renderSavedSites();
-        renderChangeBadge();
-        setView('prices');
-        const errorOnly = rows.length > 0 && rows.every((row) => row.record_type === 'error');
-        setState(errorOnly ? '未获取到价格' : '抓取完成');
+        if (acceptMutationResult(result)) {
+          rows = result.rows || [];
+          savedSites = result.saved_sites || savedSites;
+          if (Array.isArray(result.changes)) changes = result.changes;
+          latestGeneratedAt = result.generated_at || latestGeneratedAt;
+          currentPage = 0;
+          renderSavedSites();
+          renderChangeBadge();
+          setView('prices');
+          const errorOnly = rows.length > 0 && rows.every((row) => row.record_type === 'error');
+          setState(errorOnly ? '未获取到价格' : result.partial ? '部分数据可用' : '抓取完成');
+        }
         log(`认证方式：${result.tokenKey || 'cookie/session'}`);
-        log(`WebView 抓取完成：${rows.length} 行`);
+        log(`WebView 抓取完成：${(result.rows || []).length} 行`);
+        if (result.partial && result.error) log(`部分接口异常：${result.error}`);
         if (!auto && reauthActiveSite) {
-          finishActiveReauth();
+          finishActiveReauth(result.site);
         } else if (!auto) {
           setTimeout(startNextReauth, 500);
         }
-        return true;
+        return { ok: true, site: result.site || expectedSite };
       } finally {
         captureBtn.disabled = false;
       }
@@ -3013,11 +4544,9 @@ CONTROL_HTML = r"""<!doctype html>
         }
       } else if (result.accepted) {
         updateAllBtn.disabled = true;
-        rows = [];
-        latestGeneratedAt = '';
-        currentPage = 0;
-        render();
-        snapshotTime.textContent = '正在重建当前价格快照';
+        snapshotTime.textContent = latestGeneratedAt
+          ? '正在更新，当前仍显示上次快照'
+          : '正在生成当前价格快照';
         setState('后台更新中');
       } else {
         setState(reason === 'startup' ? '自动检查待命' : '无需更新');
@@ -3044,31 +4573,35 @@ CONTROL_HTML = r"""<!doctype html>
     }
 
     function applyRuntimeStatus(result) {
-      savedSites = result.saved_sites || savedSites;
-      renderSavedSites();
-      if (Array.isArray(result.changes)) {
-        changes = result.changes;
-        renderChangeBadge();
-        if (activeView === 'changes') renderChanges();
-      }
-      if (result.rows_changed) {
-        stateRevision = Number(result.revision) || stateRevision;
-        latestGeneratedAt = result.latest_generated_at || latestGeneratedAt;
-        rows = result.rows || [];
-        currentPage = 0;
-        render();
-      } else if (result.revision) {
-        stateRevision = Number(result.revision) || stateRevision;
+      const incomingRevision = Number(result.revision) || 0;
+      const stateFresh = !incomingRevision || incomingRevision >= stateRevision;
+      if (stateFresh) {
+        if (Array.isArray(result.saved_sites)) savedSites = result.saved_sites;
+        renderSavedSites();
+        if (result.smtp) applySmtpState(result.smtp, false);
+        if (Array.isArray(result.changes)) {
+          changes = result.changes;
+          renderChangeBadge();
+          if (activeView === 'changes') renderChanges();
+        }
+        if (result.rows_changed) {
+          latestGeneratedAt = result.latest_generated_at || latestGeneratedAt;
+          rows = result.rows || [];
+          currentPage = 0;
+          render();
+        }
+        advanceStateRevision(incomingRevision);
       }
 
       const update = result.update || {};
       const updating = update.status === 'running';
       const updateId = Number(update.id) || 0;
-      if (updating && updateId && updateId !== observedUpdateId) {
+      if (updateId > observedUpdateId) {
         observedUpdateId = updateId;
         deferredReauthSites.clear();
       }
       updateRunning = updating;
+      if (!updating) checkingSites.clear();
       updateAllBtn.disabled = updating;
       if (updating) {
         const completed = Number(update.completed_sites) || 0;
@@ -3089,12 +4622,13 @@ CONTROL_HTML = r"""<!doctype html>
           log(update.error || update.message || '后台更新失败');
         }
       }
-      if (!updating) {
+      if (!updating && stateFresh) {
         enqueueReauthSites(result.reauth_sites || []);
       }
       if (!updating && result.running && !reauthActiveSite && !reauthQueue.length && !update.id) {
         stateBadge.textContent = '自动检查中';
       }
+      renderSiteMonitor();
     }
 
     async function pollSchedulerStatus() {
@@ -3120,6 +4654,7 @@ CONTROL_HTML = r"""<!doctype html>
       savedSites = state.saved_sites || [];
       rows = state.latest_rows || [];
       changes = state.changes || [];
+      applySmtpState(state.smtp || {}, true);
       latestGeneratedAt = state.latest_generated_at || '';
       stateRevision = Number(state.revision) || 0;
       renderSavedSites();
@@ -3132,6 +4667,7 @@ CONTROL_HTML = r"""<!doctype html>
       } else if (siteInput.value) {
         syncDefaultNote(true);
       }
+      renderSiteMonitor();
       if (state.site) {
         log('请点击“WebView登录”，在目标站点窗口完成登录。');
       } else {
@@ -3154,8 +4690,8 @@ CONTROL_HTML = r"""<!doctype html>
           log(result.error);
           return;
         }
+        if (!acceptMutationResult(result)) return;
         changes = result.changes || [];
-        stateRevision = Number(result.revision) || stateRevision;
         renderChanges();
         log(`已将 ${unread} 条价格变化标记为已读`);
       } finally {
@@ -3164,6 +4700,11 @@ CONTROL_HTML = r"""<!doctype html>
     }
 
     siteInput.addEventListener('input', () => {
+      connectionTestResult.hidden = true;
+      if (savedSiteSelect.value && siteInput.value.trim() !== savedSiteSelect.value) {
+        savedSiteSelect.value = '';
+        renderSiteDetail();
+      }
       syncDefaultNote();
     });
     siteNameInput.addEventListener('input', () => {
@@ -3173,6 +4714,7 @@ CONTROL_HTML = r"""<!doctype html>
       const site = savedSites.find((item) => item.site === savedSiteSelect.value);
       applySavedSite(site);
       if (site) setView('sites');
+      renderSiteDetail();
     });
     for (const button of navItems) {
       button.addEventListener('click', () => setView(button.dataset.view));
@@ -3186,7 +4728,21 @@ CONTROL_HTML = r"""<!doctype html>
     changeSiteFilterSelect.addEventListener('change', renderChanges);
     changeTypeFilterSelect.addEventListener('change', renderChanges);
     unreadOnlyInput.addEventListener('change', renderChanges);
+    siteMonitorSearchInput.addEventListener('input', renderSiteMonitor);
+    siteHealthFilterSelect.addEventListener('change', renderSiteMonitor);
+    siteEnabledFilterSelect.addEventListener('change', renderSiteMonitor);
     acknowledgeChangesBtn.addEventListener('click', acknowledgeAllChanges);
+    siteDetailCheckBtn.addEventListener('click', () => startSingleSiteCheck(siteDetailCheckBtn.dataset.site));
+    siteDetailChangesBtn.addEventListener('click', () => {
+      const site = siteDetailChangesBtn.dataset.site;
+      setView('changes');
+      renderChangeSiteOptions();
+      changeSiteFilterSelect.value = site;
+      renderChanges();
+    });
+    smtpSaveBtn.addEventListener('click', () => saveSmtpSettings(false));
+    smtpTestBtn.addEventListener('click', testSmtpNotification);
+    smtpClearPasswordBtn.addEventListener('click', clearSmtpPassword);
     prevPageBtn.addEventListener('click', () => {
       if (currentPage > 0) {
         currentPage -= 1;
@@ -3206,6 +4762,7 @@ CONTROL_HTML = r"""<!doctype html>
     saveSiteBtn.addEventListener('click', saveSite);
     deleteSiteBtn.addEventListener('click', deleteSite);
     clearCredentialsBtn.addEventListener('click', clearCredentials);
+    testConnectionBtn.addEventListener('click', testSiteConnection);
     openSiteBtn.addEventListener('click', openSite);
     refreshLoginBtn.addEventListener('click', refreshLoginWebView);
     hideLoginBtn.addEventListener('click', hideLoginWebView);
@@ -3304,6 +4861,11 @@ class RemoteWindow:
 
     def hide(self):
         self.manager.call("hide", self.name)
+
+    def is_cancelled(self):
+        if self.name != "login":
+            return False
+        return bool(self.manager.call("get_cancelled", self.name))
 
     def destroy(self):
         return None
@@ -3479,8 +5041,14 @@ class BrowserHostCredentialBridge:
         try:
             if not self.site:
                 return {"ok": False, "error": "当前没有选择站点"}
-            write_site_credentials(self.site, username, password)
-            return {"ok": True, "site": self.site}
+            normalized = normalize_site(self.site)
+            if not saved_site_allows_credentials(normalized):
+                return {"ok": True, "site": normalized, "ignored": True}
+            write_site_credentials(normalized, username, password)
+            if not saved_site_allows_credentials(normalized):
+                delete_site_credentials(normalized)
+                return {"ok": True, "site": normalized, "ignored": True}
+            return {"ok": True, "site": normalized}
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
 
@@ -3530,6 +5098,8 @@ class BrowserHostRuntime:
             return True
         if command == "get_current_url":
             return window.get_current_url() or ""
+        if command == "get_cancelled":
+            return bool(name == "login" and self.login_cancelled.is_set())
         if command == "show":
             window.show()
             return True
@@ -3665,8 +5235,12 @@ class PriceAppApi:
         self.scheduler_stop = threading.Event()
         self.scheduler_thread = None
         self.scheduler_message = "自动检查未启动"
+        self.notification_stop = threading.Event()
+        self.notification_queue = queue.Queue(maxsize=100)
+        self.notification_thread = None
         self.browser_cancel_event = threading.Event()
         self.login_session_active = threading.Event()
+        self.connection_test_active = threading.Event()
         self.shutdown_event = threading.Event()
         self.shutdown_complete = threading.Event()
         self.shutdown_thread = None
@@ -3681,6 +5255,12 @@ class PriceAppApi:
         self.capture_job_thread = None
         self.capture_job_sequence = 0
         self.capture_job = self._idle_capture_job()
+        self.notification_thread = threading.Thread(
+            target=self._notification_loop,
+            name="smtp-notifications",
+            daemon=True,
+        )
+        self.notification_thread.start()
 
     def attach_controller_window(self, window):
         self.controller_window = window
@@ -3745,7 +5325,13 @@ class PriceAppApi:
             first_request = not self.shutdown_event.is_set()
             self.shutdown_event.set()
             self.scheduler_stop.set()
+            self.notification_stop.set()
+            try:
+                self.notification_queue.put_nowait(None)
+            except queue.Full:
+                pass
             self.browser_cancel_event.set()
+            close_active_smtp_clients()
             self.scheduler_message = "应用正在退出"
         if first_request:
             LOGGER.info("Shutdown requested: %s", reason)
@@ -3824,6 +5410,7 @@ class PriceAppApi:
             capture_threads = list(self.capture_threads)
         threads = [
             self.scheduler_thread,
+            self.notification_thread,
             self.update_thread,
             self.capture_job_thread,
             *capture_threads,
@@ -4035,6 +5622,7 @@ class PriceAppApi:
                 1 for item in changes if not item.get("acknowledged")
             ),
             "update": update,
+            "smtp": smtp_public_state(),
         }
 
     def initial_state(self):
@@ -4049,6 +5637,7 @@ class PriceAppApi:
             "unacknowledged_change_count": snapshot["unacknowledged_change_count"],
             "revision": snapshot["revision"],
             "update": snapshot["update"],
+            "smtp": snapshot["smtp"],
         }
 
     def acknowledge_changes(self, change_ids=None):
@@ -4067,6 +5656,245 @@ class PriceAppApi:
         except Exception as exc:
             return {"ok": False, "error": str(exc)}
 
+    def notification_state(self):
+        try:
+            return {"ok": True, "smtp": smtp_public_state()}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+    def save_smtp_settings(
+        self,
+        enabled=False,
+        host="",
+        port=587,
+        security="starttls",
+        username="",
+        from_address="",
+        recipients="",
+        subject_prefix="[Sub2API Monitor]",
+        min_severity="low",
+        notify_changes=True,
+        notify_site_errors=True,
+        notify_recoveries=True,
+        password="",
+    ):
+        try:
+            with SMTP_SETTINGS_OPERATION_LOCK:
+                current = load_smtp_settings()
+                if (
+                    current.get("enabled")
+                    and current.get("username")
+                    and not has_smtp_password(current)
+                ):
+                    current["enabled"] = False
+                    current["updated_at"] = datetime.now(timezone.utc).isoformat()
+                    current["last_error"] = "SMTP 密码不可用，通知已自动停用"
+                    current = write_smtp_settings(current)
+                candidate = normalize_smtp_settings({
+                    **current,
+                    "enabled": bool(enabled),
+                    "host": host,
+                    "port": port,
+                    "security": security,
+                    "username": username,
+                    "from_address": from_address,
+                    "recipients": recipients,
+                    "subject_prefix": subject_prefix,
+                    "min_severity": min_severity,
+                    "notify_changes": bool(notify_changes),
+                    "notify_site_errors": bool(notify_site_errors),
+                    "notify_recoveries": bool(notify_recoveries),
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
+                })
+                if candidate["enabled"]:
+                    validate_smtp_settings(candidate)
+                    if (
+                        candidate["username"]
+                        and not str(password or "")
+                        and not has_smtp_password(candidate)
+                    ):
+                        raise ValueError("启用 SMTP 前请保存密码")
+                if str(password or ""):
+                    write_smtp_password(
+                        password,
+                        candidate["username"],
+                        settings=candidate,
+                    )
+                if (
+                    candidate["enabled"]
+                    and candidate["username"]
+                    and not has_smtp_password(candidate)
+                ):
+                    candidate["enabled"] = False
+                    candidate["last_error"] = "SMTP 密码不可用，通知已自动停用"
+                saved = write_smtp_settings(candidate)
+            revision = self._cache_state()
+            return {
+                "ok": True,
+                "smtp": {
+                    **saved,
+                    "has_password": has_smtp_password(saved),
+                    "logs": load_notification_logs(),
+                },
+                "revision": revision,
+            }
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+    def clear_smtp_password(self):
+        try:
+            with SMTP_SETTINGS_OPERATION_LOCK:
+                deleted = delete_smtp_password()
+                settings = load_smtp_settings()
+                if settings.get("enabled") and settings.get("username"):
+                    settings["enabled"] = False
+                    settings["updated_at"] = datetime.now(timezone.utc).isoformat()
+                    settings["last_error"] = "SMTP 密码已清除，通知已自动停用"
+                    write_smtp_settings(settings)
+            revision = self._cache_state()
+            return {
+                "ok": True,
+                "deleted": deleted,
+                "smtp": smtp_public_state(),
+                "revision": revision,
+            }
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+    def test_smtp_notification(self):
+        settings = load_smtp_settings()
+        now = datetime.now(timezone.utc).isoformat()
+        try:
+            validate_smtp_settings(settings, require_password=True)
+            subject = send_smtp_message(
+                settings,
+                "SMTP 测试成功",
+                "这是一封来自 Sub2API Monitor 的 SMTP 测试邮件。\n\n收到此邮件表示服务器、加密方式和凭据均可用。",
+            )
+            update_smtp_delivery_state(
+                last_test_at=now,
+                last_sent_at=now,
+                last_error="",
+            )
+            append_notification_log({
+                "sent_at": now,
+                "status": "sent",
+                "kind": "test",
+                "event_count": 0,
+                "target": ", ".join(masked_email(item) for item in settings["recipients"]),
+                "subject": subject,
+                "error": "",
+            })
+            revision = self._cache_state()
+            return {"ok": True, "smtp": smtp_public_state(), "revision": revision}
+        except Exception as exc:
+            error = redact_log_text(exc)
+            update_smtp_delivery_state(last_test_at=now, last_error=error)
+            append_notification_log({
+                "sent_at": now,
+                "status": "failed",
+                "kind": "test",
+                "event_count": 0,
+                "target": ", ".join(masked_email(item) for item in settings.get("recipients") or []),
+                "subject": "SMTP 测试",
+                "error": error,
+            })
+            revision = self._cache_state()
+            return {
+                "ok": False,
+                "error": error,
+                "smtp": smtp_public_state(),
+                "revision": revision,
+            }
+
+    @staticmethod
+    def _notification_change_allowed(change, settings):
+        change_type = str(change.get("change_type") or "")
+        if change_type in {"site_error", "site_unhealthy"}:
+            enabled = settings.get("notify_site_errors", True)
+        elif change_type == "site_recovered":
+            enabled = settings.get("notify_recoveries", True)
+        else:
+            enabled = settings.get("notify_changes", True)
+        if not enabled:
+            return False
+        severity = str(change.get("severity") or "low").lower()
+        minimum = str(settings.get("min_severity") or "low").lower()
+        return SEVERITY_ORDER.get(severity, 0) >= SEVERITY_ORDER.get(minimum, 0)
+
+    def _queue_change_notifications(self, changes):
+        settings = load_smtp_settings()
+        if not settings.get("enabled"):
+            return False
+        selected = [
+            dict(change) for change in changes or []
+            if isinstance(change, dict) and self._notification_change_allowed(change, settings)
+        ]
+        if not selected:
+            return False
+        try:
+            self.notification_queue.put_nowait(selected)
+            return True
+        except queue.Full:
+            LOGGER.warning("SMTP notification queue is full; dropped %s changes", len(selected))
+            append_notification_log({
+                "sent_at": datetime.now(timezone.utc).isoformat(),
+                "status": "failed",
+                "kind": "changes",
+                "event_count": len(selected),
+                "target": "<queue-full>",
+                "subject": "价格变化通知",
+                "error": "SMTP 通知队列已满",
+            })
+            return False
+
+    def _notification_loop(self):
+        while not self.notification_stop.is_set():
+            try:
+                changes = self.notification_queue.get(timeout=0.5)
+            except queue.Empty:
+                continue
+            try:
+                if changes is None:
+                    return
+                self._send_change_notification(changes)
+            except Exception:
+                LOGGER.exception("Unhandled SMTP notification error")
+            finally:
+                self.notification_queue.task_done()
+
+    def _send_change_notification(self, changes):
+        settings = load_smtp_settings()
+        selected = [
+            change for change in changes or []
+            if self._notification_change_allowed(change, settings)
+        ]
+        if not settings.get("enabled") or not selected:
+            return
+        now = datetime.now(timezone.utc).isoformat()
+        subject, body = build_smtp_change_message(selected)
+        try:
+            full_subject = send_smtp_message(settings, subject, body)
+            update_smtp_delivery_state(last_sent_at=now, last_error="")
+            status = "sent"
+            error = ""
+        except Exception as exc:
+            full_subject = subject
+            status = "failed"
+            error = redact_log_text(exc)
+            update_smtp_delivery_state(last_error=error)
+            LOGGER.warning("SMTP notification failed: %s", error)
+        append_notification_log({
+            "sent_at": now,
+            "status": status,
+            "kind": "changes",
+            "event_count": len(selected),
+            "target": ", ".join(masked_email(item) for item in settings.get("recipients") or []),
+            "subject": full_subject,
+            "error": error,
+        })
+        self._cache_state()
+
     def save_site(
         self,
         name,
@@ -4076,13 +5904,11 @@ class PriceAppApi:
         remember_credentials=True,
         auto_login=True,
         auto_refresh=True,
+        include_groups=True,
     ):
         try:
             normalized = normalize_site(site)
             with self.data_lock:
-                if not remember_credentials:
-                    delete_site_credentials(normalized)
-                    self.auto_login_attempts.pop(normalized, None)
                 saved = self._upsert_saved_site(
                     name,
                     normalized,
@@ -4091,7 +5917,11 @@ class PriceAppApi:
                     remember_credentials,
                     auto_login,
                     auto_refresh,
+                    include_groups,
                 )
+                if not remember_credentials:
+                    delete_site_credentials(normalized)
+                    self.auto_login_attempts.pop(normalized, None)
                 annotated = annotate_saved_sites(saved)
                 revision = self._cache_state(saved_sites=annotated)
             return {
@@ -4107,18 +5937,38 @@ class PriceAppApi:
         try:
             normalized = normalize_site(site)
             with self.data_lock:
-                credentials_deleted = delete_site_credentials(normalized)
-                saved = [item for item in load_saved_sites() if item.get("site") != normalized]
+                existing_sites = load_saved_sites()
+                if not any(item.get("site") == normalized for item in existing_sites):
+                    raise ValueError("未找到要删除的已保存站点")
+                saved = [item for item in existing_sites if item.get("site") != normalized]
                 write_saved_sites(saved)
+                credentials_deleted = delete_site_credentials(normalized)
                 changes = remove_price_changes_for_site(normalized)
+                remaining_rows = [
+                    dict(item) for item in load_latest_rows()
+                    if isinstance(item, dict) and _change_site_key(item) != normalized
+                ]
+                snapshot = write_price_snapshot(remaining_rows, {
+                    "site_count": 0,
+                    "success_count": 0,
+                    "error_count": 0,
+                    "mode": "site_deleted",
+                })
+                remove_price_history_for_site(normalized)
                 self.auto_login_attempts.pop(normalized, None)
                 annotated = annotate_saved_sites(saved)
-                revision = self._cache_state(saved_sites=annotated)
+                revision = self._cache_state(
+                    rows=remaining_rows,
+                    saved_sites=annotated,
+                    generated_at=snapshot["generated_at"],
+                )
             return {
                 "ok": True,
                 "site": normalized,
                 "credentials_deleted": credentials_deleted,
                 "saved_sites": annotated,
+                "rows": remaining_rows,
+                "generated_at": snapshot["generated_at"],
                 "changes": changes,
                 "unacknowledged_change_count": sum(
                     1 for item in changes if not item.get("acknowledged")
@@ -4132,14 +5982,25 @@ class PriceAppApi:
         try:
             normalized = normalize_site(site)
             with self.data_lock:
+                records = load_saved_sites()
+                updated_records = []
+                for item in records:
+                    updated = dict(item)
+                    if updated.get("site") == normalized:
+                        updated["remember_credentials"] = False
+                        updated["auto_login"] = False
+                        updated["updated_at"] = datetime.now(timezone.utc).isoformat()
+                    updated_records.append(updated)
+                write_saved_sites(updated_records)
                 deleted = delete_site_credentials(normalized)
                 self.auto_login_attempts.pop(normalized, None)
-                revision = self._mark_credentials_cached(normalized, False)
+                annotated = annotate_saved_sites(updated_records)
+                revision = self._cache_state(saved_sites=annotated)
             return {
                 "ok": True,
                 "site": normalized,
                 "deleted": deleted,
-                "saved_sites": self._state_snapshot(revision)["saved_sites"],
+                "saved_sites": annotated,
                 "revision": revision,
             }
         except Exception as exc:
@@ -4152,10 +6013,12 @@ class PriceAppApi:
             current_url = self.browser_window.get_current_url() if self.browser_window else ""
             if not self._same_site_host(self.site, current_url):
                 raise RuntimeError("当前登录页与所选站点不一致，已拒绝保存密码")
-            record = self._record_for_site(self.site, API_BASE)
-            if record.get("remember_credentials") is False:
+            if not saved_site_allows_credentials(self.site):
                 return {"ok": True, "site": self.site, "ignored": True}
             write_site_credentials(self.site, username, password)
+            if not saved_site_allows_credentials(self.site):
+                delete_site_credentials(self.site)
+                return {"ok": True, "site": self.site, "ignored": True}
             revision = self._mark_credentials_cached(self.site, True)
             return {"ok": True, "site": self.site, "revision": revision}
         except Exception as exc:
@@ -4168,7 +6031,21 @@ class PriceAppApi:
             return {"ok": False, "busy": True, "error": "登录窗口正在抓取，请稍后再试"}
         try:
             self._raise_if_shutting_down()
+            with self.capture_job_lock:
+                if self.capture_job_thread and self.capture_job_thread.is_alive():
+                    return {
+                        "ok": False,
+                        "busy": True,
+                        "capture_running": True,
+                        "error": "当前 WebView 抓取仍在运行，请等待完成或暂时跳过",
+                    }
             with self.job_lock:
+                if self.connection_test_active.is_set():
+                    return {
+                        "ok": False,
+                        "busy": True,
+                        "error": "站点连接测试仍在运行，请稍后打开登录窗口",
+                    }
                 if self.update_thread and self.update_thread.is_alive():
                     return {
                         "ok": False,
@@ -4206,11 +6083,17 @@ class PriceAppApi:
             return {"ok": False, "busy": True, "error": "登录窗口仍在执行操作，请稍后再试"}
         try:
             self._raise_if_shutting_down()
+            with self.capture_job_lock:
+                if self.capture_job_thread and self.capture_job_thread.is_alive():
+                    return {"ok": False, "busy": True, "error": "当前抓取仍在运行，请稍后刷新"}
+            if self.connection_test_active.is_set():
+                return {"ok": False, "busy": True, "error": "站点连接测试仍在运行"}
             self.login_session_active.set()
             window = self._ensure_browser_window(self.site, visible=True)
             self._start_credential_helper(self.site)
             return {"ok": True, "site": self.site, "operation_id": self.browser_operation_id}
         except Exception as exc:
+            self.login_session_active.clear()
             return {"ok": False, "error": str(exc)}
         finally:
             self.interactive_operation_lock.release()
@@ -4219,7 +6102,12 @@ class PriceAppApi:
         if self.shutdown_event.is_set():
             return {"ok": False, "shutting_down": True, "error": "应用正在退出"}
         self.browser_cancel_event.set()
-        self.login_session_active.clear()
+        with self.capture_job_lock:
+            capture_running = bool(
+                self.capture_job_thread and self.capture_job_thread.is_alive()
+            )
+        if not capture_running:
+            self.login_session_active.clear()
         if not self._browser_alive():
             return {"ok": True, "hidden": False, "site": self.site}
         threading.Thread(
@@ -4233,6 +6121,18 @@ class PriceAppApi:
     def start_capture_prices(self, api_base=API_BASE, include_groups=True, close_browser=True):
         if self.shutdown_event.is_set():
             return {"ok": False, "shutting_down": True, "error": "应用正在退出"}
+        if not self.site:
+            return {"ok": False, "error": "请先打开目标站点"}
+        with self.job_lock:
+            if self.connection_test_active.is_set():
+                return {"ok": False, "busy": True, "error": "站点连接测试仍在运行"}
+            if self.update_thread and self.update_thread.is_alive():
+                return {
+                    "ok": False,
+                    "busy": True,
+                    "update_running": True,
+                    "error": "后台更新仍在运行，请等待完成后再抓取",
+                }
         with self.capture_job_lock:
             if self.capture_job_thread and self.capture_job_thread.is_alive():
                 return {
@@ -4250,6 +6150,8 @@ class PriceAppApi:
                 "message": "WebView 抓取中",
                 "started_at": datetime.now(timezone.utc).isoformat(),
                 "completed_at": "",
+                "site": self.site,
+                "operation_id": self.browser_operation_id,
                 "result": {},
             }
             self.capture_job_thread = threading.Thread(
@@ -4275,7 +6177,14 @@ class PriceAppApi:
             result = {"ok": False, "error": str(exc)}
         with self.capture_job_lock:
             if self.capture_job.get("id") == job_id:
-                cancelled = self.shutdown_event.is_set()
+                cancelled = bool(
+                    self.shutdown_event.is_set()
+                    or result.get("cancelled")
+                    or (
+                        result.get("error_code") == "window_closed"
+                        and self.browser_cancel_event.is_set()
+                    )
+                )
                 self.capture_job.update({
                     "status": "cancelled" if cancelled else "completed" if result.get("ok") else "failed",
                     "message": "应用退出，抓取已取消" if cancelled else "抓取完成" if result.get("ok") else "抓取失败",
@@ -4284,6 +6193,8 @@ class PriceAppApi:
                 })
             if self.capture_job_thread is threading.current_thread():
                 self.capture_job_thread = None
+        if self.browser_cancel_event.is_set():
+            self.login_session_active.clear()
 
     def capture_status(self, job_id=0):
         try:
@@ -4306,21 +6217,29 @@ class PriceAppApi:
             self._raise_if_shutting_down()
             if not self.site:
                 raise RuntimeError("请先打开目标站点")
-            if self.browser_cancel_event.is_set() and not self._browser_alive():
-                raise RuntimeError("WINDOW_CLOSED: 登录窗口已关闭，请重新点击 WebView 登录")
+            target_site = self.site
+            with self.data_lock:
+                target_was_saved = any(
+                    item.get("site") == target_site for item in load_saved_sites()
+                    if isinstance(item, dict)
+                )
+            operation_id = self.browser_operation_id
+            self._raise_if_browser_capture_cancelled(operation_id, target_site)
             if self._browser_alive():
                 self._ensure_browser_window(visible=False)
             else:
-                self._ensure_browser_window(self.site, visible=False)
+                self._ensure_browser_window(target_site, visible=False)
             window = self.browser_window
-            credential_state = self._prepare_login_credentials(self.site, window, allow_save=True)
+            self._raise_if_browser_capture_cancelled(operation_id, target_site, window)
+            credential_state = self._prepare_login_credentials(target_site, window, allow_save=True)
             if credential_state.get("autoSubmitted"):
-                self._wait_for_auto_login(self.site, window, allow_save=True)
+                self._wait_for_auto_login(target_site, window, allow_save=True)
             base = str(api_base or API_BASE).strip()
             if not base.startswith("/"):
                 base = f"/{base}"
             options = {
                 "base": base,
+                "site": target_site,
                 "includeGroups": bool(include_groups),
                 "outputFields": OUTPUT_FIELDS,
                 "requestTimeoutMs": 25000,
@@ -4328,6 +6247,7 @@ class PriceAppApi:
             script = collector_js_template().replace("__OPTIONS__", json.dumps(options, ensure_ascii=False))
             result = self._evaluate_async(window, script, timeout=60)
             self._raise_if_shutting_down()
+            self._raise_if_browser_capture_cancelled(operation_id, target_site, window)
             if not isinstance(result, dict):
                 raise RuntimeError(f"抓取脚本返回了异常结果：{result!r}")
             if "rows" not in result:
@@ -4337,32 +6257,64 @@ class PriceAppApi:
                 error_code = self._rows_error_code(fresh_rows)
                 message = self._rows_error_message(fresh_rows) or "还没有获取到价格，请确认已完成登录"
                 raise RuntimeError(f"{error_code.upper()}: {message}" if error_code else message)
-            self.auto_login_attempts.pop(self.site, None)
+            result = self._normalize_capture_result(result)
+            fresh_rows = result.get("rows") or []
+            self.auto_login_attempts.pop(target_site, None)
+            discarded = False
             with self.data_lock:
-                merged_rows = replace_price_rows(load_latest_rows(), fresh_rows, [self.site])
-                snapshot = write_price_snapshot(merged_rows, {
-                    "site_count": 1,
-                    "success_count": 1,
-                    "error_count": 0,
-                    "mode": "manual_webview",
-                })
-                record = next((item for item in load_saved_sites() if item.get("site") == self.site), None)
-                if record:
-                    saved_sites = self._update_site_status(record, {"ok": True, "rows": fresh_rows})
-                else:
-                    saved_sites = [dict(item) for item in self.cached_saved_sites]
-                changes = load_price_changes()
-                revision = self._cache_state(
-                    rows=merged_rows,
-                    saved_sites=saved_sites,
-                    generated_at=snapshot["generated_at"],
+                self._raise_if_browser_capture_cancelled(operation_id, target_site, window)
+                current_saved_sites = load_saved_sites()
+                record = next(
+                    (item for item in current_saved_sites if item.get("site") == target_site),
+                    None,
                 )
+                if target_was_saved and not record:
+                    discarded = True
+                else:
+                    merged_rows = replace_price_rows(load_latest_rows(), fresh_rows, [target_site])
+                    health_changes = []
+                    if record:
+                        status_update = self._site_status_record(record, result)
+                        transition = site_status_transition_change(record, status_update)
+                        if transition:
+                            transition["item_label"] = status_update.get("name") or status_update.get("site")
+                            health_changes.append(transition)
+                    snapshot = write_price_snapshot(merged_rows, {
+                        "site_count": 1,
+                        "success_count": 1 if result.get("healthy") else 0,
+                        "error_count": 0 if result.get("healthy") else 1,
+                        "mode": "manual_webview",
+                    }, extra_changes=health_changes)
+                    if record:
+                        saved_sites = self._update_site_status(record, result)
+                    else:
+                        saved_sites = [dict(item) for item in self.cached_saved_sites]
+                    changes = load_price_changes()
+                    revision = self._cache_state(
+                        rows=merged_rows,
+                        saved_sites=saved_sites,
+                        generated_at=snapshot["generated_at"],
+                    )
+            if discarded:
+                if close_browser:
+                    self._hide_browser_window(operation_id)
+                    self.login_session_active.clear()
+                return {
+                    "ok": False,
+                    "cancelled": True,
+                    "discarded": True,
+                    "site": target_site,
+                    "error": "站点已删除，已丢弃本次抓取结果",
+                    "error_code": "site_deleted",
+                    "status_label": "站点已删除",
+                }
+            self._queue_change_notifications(snapshot.get("changes") or [])
             if close_browser:
-                self._hide_browser_window()
+                self._hide_browser_window(operation_id)
                 self.login_session_active.clear()
             return {
-                "ok": True,
                 **result,
+                "site": target_site,
                 "generated_at": snapshot["generated_at"],
                 "rows": merged_rows,
                 "saved_sites": saved_sites,
@@ -4374,6 +6326,8 @@ class PriceAppApi:
             failure = self._classify_capture_failure(error, self.browser_window)
             return {
                 "ok": False,
+                "cancelled": failure["error_code"] == "window_closed",
+                "site": self.site,
                 "error": error,
                 "auth_required": failure["auth_required"],
                 "error_code": failure["error_code"],
@@ -4385,10 +6339,118 @@ class PriceAppApi:
     def update_all_prices(self):
         return self.start_update_all_prices("manual", False)
 
-    def start_update_all_prices(self, reason="manual", only_due=False):
+    def start_site_check(self, site):
+        return self.start_update_all_prices("site_manual", False, site)
+
+    def test_site_connection(self, site, api_base=API_BASE, include_groups=True):
+        owns_connection_test = False
+        try:
+            self._raise_if_shutting_down()
+            normalized = normalize_site(site)
+            with self.job_lock:
+                if self.connection_test_active.is_set():
+                    return {"ok": False, "busy": True, "error": "已有连接测试正在运行"}
+                if self.update_thread and self.update_thread.is_alive():
+                    return {"ok": False, "busy": True, "error": "后台更新仍在运行"}
+                with self.capture_job_lock:
+                    if self.capture_job_thread and self.capture_job_thread.is_alive():
+                        return {"ok": False, "busy": True, "error": "WebView 抓取仍在运行"}
+                if self.login_session_active.is_set():
+                    return {"ok": False, "busy": True, "error": "登录窗口仍在处理"}
+                self.connection_test_active.set()
+                owns_connection_test = True
+            records = load_saved_sites()
+            record = next((item for item in records if item.get("site") == normalized), None)
+            record = dict(record or self._record_for_site(normalized, api_base))
+            record["site"] = normalized
+            record["api_base"] = self._normalized_api_base(api_base)
+            record["include_groups"] = bool(include_groups)
+            with self.update_lock:
+                result = self._capture_site_webview(
+                    record,
+                    bool(include_groups),
+                    0,
+                )
+            normalized_result = self._normalize_capture_result(result)
+            rows = [
+                row for row in normalized_result.get("rows") or []
+                if row.get("record_type") != "error"
+            ]
+            rate_data = normalized_result.get("rateData")
+            rate_data = rate_data if isinstance(rate_data, dict) else {}
+            return {
+                "ok": bool(normalized_result.get("ok")),
+                "healthy": bool(normalized_result.get("healthy")),
+                "partial": bool(normalized_result.get("partial")),
+                "auth_required": bool(normalized_result.get("auth_required")),
+                "error": normalized_result.get("error") or "",
+                "error_code": normalized_result.get("error_code") or "",
+                "status_label": normalized_result.get("status_label") or "",
+                "site": normalized,
+                "row_count": len(rows),
+                "plan_count": len([row for row in rows if row.get("record_type") == "plan"]),
+                "group_count": len([row for row in rows if row.get("record_type") == "group"]),
+                "user_rate_count": len([
+                    row for row in rows if row.get("rate_source") == "user_override"
+                ]),
+                "sources": sorted({str(row.get("source")) for row in rows if row.get("source")}),
+                "rate_data_complete": bool(rate_data.get("complete")),
+                "rate_optional_unavailable": bool(rate_data.get("optionalUnavailable")),
+            }
+        except Exception as exc:
+            error = str(exc)
+            failure = self._classify_capture_failure(error)
+            return {"ok": False, "error": error, **failure}
+        finally:
+            if owns_connection_test:
+                self.connection_test_active.clear()
+
+    def set_site_monitoring(self, site, enabled=True):
+        try:
+            normalized = normalize_site(site)
+            with self.data_lock:
+                records = load_saved_sites()
+                found = False
+                updated_records = []
+                for item in records:
+                    updated = dict(item)
+                    if updated.get("site") == normalized:
+                        found = True
+                        updated["auto_refresh"] = bool(enabled)
+                        updated["updated_at"] = datetime.now(timezone.utc).isoformat()
+                        if enabled:
+                            updated["next_run"] = datetime.now(timezone.utc).isoformat()
+                    updated_records.append(updated)
+                if not found:
+                    raise ValueError("未找到该站点")
+                write_saved_sites(updated_records)
+                annotated = annotate_saved_sites(updated_records)
+                revision = self._cache_state(saved_sites=annotated)
+            return {"ok": True, "site": normalized, "enabled": bool(enabled), "saved_sites": annotated, "revision": revision}
+        except Exception as exc:
+            return {"ok": False, "error": str(exc)}
+
+    def start_update_all_prices(self, reason="manual", only_due=False, site=""):
         try:
             self._raise_if_shutting_down()
             with self.job_lock:
+                if self.connection_test_active.is_set():
+                    return {
+                        "ok": True,
+                        "accepted": False,
+                        "busy": True,
+                        "connection_test_active": True,
+                        "update": dict(self.update_job),
+                    }
+                with self.capture_job_lock:
+                    if self.capture_job_thread and self.capture_job_thread.is_alive():
+                        return {
+                            "ok": True,
+                            "accepted": False,
+                            "busy": True,
+                            "capture_active": True,
+                            "update": dict(self.update_job),
+                        }
                 if self.login_session_active.is_set():
                     return {
                         "ok": True,
@@ -4408,6 +6470,11 @@ class PriceAppApi:
                     sites = load_saved_sites()
                 if not sites:
                     raise RuntimeError("还没有保存站点")
+                requested_site = normalize_site(site) if str(site or "").strip() else ""
+                if requested_site:
+                    sites = [item for item in sites if item.get("site") == requested_site]
+                    if not sites:
+                        raise RuntimeError("未找到要检查的站点")
                 reason_name = str(reason or "manual").strip().lower()
                 enabled_only = reason_name in {"startup", "scheduler"}
                 due_sites = [
@@ -4437,6 +6504,7 @@ class PriceAppApi:
                     "completed_sites": 0,
                     "total_sites": len(due_sites),
                     "current_site": "",
+                    "requested_site": requested_site,
                     "summary": {},
                     "error": "",
                 }
@@ -4576,7 +6644,11 @@ class PriceAppApi:
                         return
                     try:
                         self._raise_if_shutting_down()
-                        result = self._capture_site_webview(record, True, slot)
+                        result = self._capture_site_webview(
+                            record,
+                            bool(record.get("include_groups", True)),
+                            slot,
+                        )
                         results.put((index, record, result, None))
                     except Exception as exc:
                         results.put((index, record, None, exc))
@@ -4651,6 +6723,8 @@ class PriceAppApi:
 
         fresh_rows = []
         captured_updates = {}
+        captured_results = {}
+        health_changes = []
         success_count = 0
         error_count = 0
         worker_count = min(MAX_SITE_WORKERS, len(due_sites))
@@ -4663,7 +6737,12 @@ class PriceAppApi:
             fresh_rows.extend(rows)
             updated = self._site_status_record(record, result)
             captured_updates[updated["site"]] = updated
-            if result.get("ok"):
+            captured_results[updated["site"]] = result
+            transition = site_status_transition_change(record, updated)
+            if transition:
+                transition["item_label"] = updated.get("name") or updated.get("site")
+                health_changes.append(transition)
+            if result.get("healthy", result.get("ok")):
                 success_count += 1
             else:
                 error_count += 1
@@ -4674,16 +6753,47 @@ class PriceAppApi:
         self._raise_if_shutting_down()
         with self.data_lock:
             current_records = load_saved_sites()
+            active_sites = {
+                item.get("site") for item in current_records if item.get("site")
+            }
+            captured_updates = {
+                site: updated for site, updated in captured_updates.items()
+                if site in active_sites
+            }
+            captured_results = {
+                site: result for site, result in captured_results.items()
+                if site in active_sites
+            }
+            fresh_rows = [
+                row for row in fresh_rows
+                if isinstance(row, dict) and _change_site_key(row) in active_sites
+            ]
+            health_changes = [
+                change for change in health_changes
+                if _change_site_key(change) in active_sites
+            ]
             status_fields = (
                 "last_run",
                 "last_status",
                 "last_error",
                 "last_error_code",
                 "last_status_label",
+                "health_status",
+                "health_label",
+                "consecutive_failures",
+                "last_success_at",
+                "last_failure_at",
                 "reauth_required",
                 "reauth_requested_at",
                 "last_row_count",
                 "last_plan_count",
+                "last_group_count",
+                "last_exclusive_count",
+                "last_user_rate_count",
+                "last_core_status",
+                "last_enrichment_status",
+                "last_enrichment_error",
+                "check_history",
                 "next_run",
                 "updated_at",
             )
@@ -4702,27 +6812,37 @@ class PriceAppApi:
             write_saved_sites(merged_sites)
             annotated_sites = annotate_saved_sites(merged_sites)
             reauth_sites = self._reauth_sites(annotated_sites)
+            refreshed_sites = [
+                record.get("site", "") for record in due_sites
+                if record.get("site") in active_sites
+            ]
+            success_count = sum(
+                1 for result in captured_results.values()
+                if result.get("healthy", result.get("ok"))
+            )
+            error_count = len(captured_results) - success_count
             summary = {
-                "site_count": len(due_sites),
+                "site_count": len(refreshed_sites),
                 "success_count": success_count,
                 "error_count": error_count,
                 "reauth_count": len(reauth_sites),
-                "skipped_count": max(0, len(sites) - len(due_sites)),
+                "skipped_count": max(0, len(sites) - len(refreshed_sites)),
             }
-            refreshed_sites = [record.get("site", "") for record in due_sites]
             all_rows = replace_price_rows(load_latest_rows(), fresh_rows, refreshed_sites)
-            snapshot = write_price_snapshot(all_rows, summary)
+            snapshot = write_price_snapshot(all_rows, summary, extra_changes=health_changes)
             self._cache_state(
                 rows=all_rows,
                 saved_sites=annotated_sites,
                 generated_at=snapshot["generated_at"],
             )
+        self._queue_change_notifications(snapshot.get("changes") or [])
         return {
             "rows": all_rows,
             "saved_sites": annotated_sites,
             "reauth_sites": reauth_sites,
             "generated_at": snapshot["generated_at"],
             "summary": summary,
+            "changes": snapshot.get("changes") or [],
         }
 
     def _capture_site_webview(self, record, include_groups=True, worker_slot=0):
@@ -4741,6 +6861,7 @@ class PriceAppApi:
                     self._wait_for_auto_login(site, window, allow_save=False)
                 options = {
                     "base": base,
+                    "site": site,
                     "includeGroups": bool(include_groups),
                     "outputFields": OUTPUT_FIELDS,
                     "requestTimeoutMs": 25000,
@@ -4756,8 +6877,8 @@ class PriceAppApi:
                     error_code = self._rows_error_code(result.get("rows") or [])
                     message = self._rows_error_message(result.get("rows") or []) or "未获取到价格"
                     raise RuntimeError(f"{error_code.upper()}: {message}" if error_code else message)
+                result = self._normalize_capture_result(result)
                 self.auto_login_attempts.pop(site, None)
-                result["ok"] = True
                 LOGGER.info("Site capture completed slot=%s host=%s", worker_slot + 1, urlparse(site).netloc)
                 return result
             except AppShutdownRequested:
@@ -4772,7 +6893,7 @@ class PriceAppApi:
                     error,
                 )
                 failure = self._classify_capture_failure(error, window)
-                return {
+                return self._normalize_capture_result({
                     "ok": False,
                     "auth_required": failure["auth_required"],
                     "error_code": failure["error_code"],
@@ -4792,7 +6913,7 @@ class PriceAppApi:
                         "status_label": failure["status_label"],
                     }],
                     "error": error,
-                }
+                })
 
     @staticmethod
     def _same_site_host(site, current_url):
@@ -4936,6 +7057,7 @@ class PriceAppApi:
             "browser_mode": "webview",
             "interval_minutes": 180,
             "auto_refresh": True,
+            "include_groups": True,
             "remember_credentials": True,
             "auto_login": True,
             "next_run": now.isoformat(),
@@ -4951,6 +7073,7 @@ class PriceAppApi:
         return annotate_saved_sites(merged)
 
     def _site_status_record(self, record, result):
+        result = self._normalize_capture_result(result)
         updated = dict(record)
         rows = result.get("rows") or []
         now = datetime.now(timezone.utc).isoformat()
@@ -4959,25 +7082,167 @@ class PriceAppApi:
         updated["api_base"] = self._normalized_api_base(updated.get("api_base", API_BASE))
         updated["browser_mode"] = "webview"
         updated["auto_refresh"] = bool(record.get("auto_refresh", True))
+        updated["include_groups"] = bool(record.get("include_groups", True))
         updated["last_run"] = now
         auth_required = bool(result.get("auth_required"))
         error_code = result.get("error_code") or ("reauth_required" if auth_required else "")
         if not result.get("ok") and not error_code:
             error_code = self._classify_error_text(result.get("error") or "")
         status_label = result.get("status_label") or self._error_label(error_code)
-        updated["last_status"] = (
-            "ok" if result.get("ok") else "reauth_required" if auth_required else error_code or "error"
+        success = bool(result.get("healthy", result.get("ok")))
+        try:
+            previous_failures = max(0, int(record.get("consecutive_failures") or 0))
+        except (TypeError, ValueError):
+            previous_failures = 0
+        consecutive_failures = 0 if success else previous_failures + 1
+        health_status = (
+            "ok"
+            if success
+            else "needs_auth"
+            if auth_required
+            else "failed"
+            if consecutive_failures >= 3
+            else "warning"
         )
+        updated["last_status"] = (
+            "ok" if success else "reauth_required" if auth_required else error_code or "error"
+        )
+        updated["health_status"] = health_status
+        updated["health_label"] = {
+            "ok": "正常",
+            "warning": "异常观察中",
+            "failed": "连续失败",
+            "needs_auth": "需重新授权",
+        }[health_status]
+        updated["consecutive_failures"] = consecutive_failures
+        updated["last_success_at"] = now if success else str(record.get("last_success_at") or "")
+        updated["last_failure_at"] = str(record.get("last_failure_at") or "") if success else now
         updated["reauth_required"] = auth_required
         updated["reauth_requested_at"] = now if auth_required else ""
-        updated["last_error"] = "" if result.get("ok") else (result.get("error") or "")
-        updated["last_error_code"] = "" if result.get("ok") else error_code
-        updated["last_status_label"] = "正常" if result.get("ok") else status_label
+        updated["last_error"] = "" if success else (result.get("error") or "")
+        updated["last_error_code"] = "" if success else error_code
+        updated["last_status_label"] = "正常" if success else status_label
+        rate_data = result.get("rateData")
+        rate_data = rate_data if isinstance(rate_data, dict) else {}
+        updated["last_core_status"] = (
+            "partial"
+            if any(row.get("status") == "partial" for row in rows)
+            else "ok"
+            if self._has_price_rows(rows)
+            else "error"
+        )
+        if rate_data.get("complete"):
+            enrichment_status = "complete"
+        elif result.get("optional_unavailable"):
+            enrichment_status = "unsupported"
+        elif auth_required:
+            enrichment_status = "needs_auth"
+        elif result.get("partial"):
+            enrichment_status = "degraded"
+        else:
+            enrichment_status = "unknown"
+        updated["last_enrichment_status"] = enrichment_status
+        updated["last_enrichment_error"] = (
+            str(rate_data.get("error") or result.get("error") or "")
+            if enrichment_status in {"needs_auth", "degraded"}
+            else ""
+        )
+        check_history = [
+            dict(entry) for entry in record.get("check_history") or []
+            if isinstance(entry, dict)
+        ]
+        check_history.insert(0, {
+            "checked_at": now,
+            "status": "ok" if success else "partial" if self._has_price_rows(rows) else "error",
+            "health_status": health_status,
+            "row_count": len([row for row in rows if row.get("record_type") != "error"]),
+            "plan_count": len([row for row in rows if row.get("record_type") == "plan"]),
+            "group_count": len([row for row in rows if row.get("record_type") == "group"]),
+            "error_code": "" if success else error_code,
+            "status_label": "正常" if success else status_label,
+        })
+        updated["check_history"] = check_history[:SITE_CHECK_HISTORY_LIMIT]
         updated["last_row_count"] = len(rows)
         updated["last_plan_count"] = len([row for row in rows if row.get("record_type") == "plan"])
+        group_rows = [row for row in rows if row.get("record_type") == "group"]
+        updated["last_group_count"] = len(group_rows)
+        updated["last_exclusive_count"] = len([
+            row for row in group_rows if bool(row.get("is_exclusive"))
+        ])
+        updated["last_user_rate_count"] = len([
+            row for row in group_rows if row.get("rate_source") == "user_override"
+        ])
         updated["next_run"] = schedule_next_run(updated, datetime.fromisoformat(now)).isoformat()
         updated["updated_at"] = now
         return updated
+
+    @classmethod
+    def _normalize_capture_result(cls, result):
+        normalized = dict(result or {})
+        rows = [dict(row) for row in normalized.get("rows") or [] if isinstance(row, dict)]
+        rate_data = normalized.get("rateData")
+        rate_data = dict(rate_data) if isinstance(rate_data, dict) else {}
+        row_error_code = cls._rows_error_code(rows)
+        auth_required = bool(
+            normalized.get("auth_required")
+            or rate_data.get("authRequired")
+            or row_error_code == "reauth_required"
+        )
+        optional_unavailable = bool(rate_data.get("optionalUnavailable"))
+        partial = bool(
+            normalized.get("partial")
+            or any(row.get("status") == "partial" for row in rows)
+            or (rate_data.get("partial") and not optional_unavailable)
+        )
+        error_code = str(normalized.get("error_code") or row_error_code or "")
+        if auth_required:
+            error_code = "reauth_required"
+            partial = True
+        elif not error_code and partial:
+            error_code = str(rate_data.get("errorCode") or "unknown_error")
+        error = str(normalized.get("error") or cls._rows_error_message(rows) or "")
+        if not error and partial:
+            error = str(rate_data.get("error") or "部分接口暂时不可用")
+        data_available = cls._has_price_rows(rows)
+        sanitized_rows = []
+        for row in rows:
+            sanitized = dict(row)
+            if sanitized.get("error"):
+                sanitized["error"] = redact_log_text(sanitized["error"])
+            sanitized_rows.append(sanitized)
+        if rate_data.get("error"):
+            rate_data["error"] = redact_log_text(rate_data["error"])
+        normalized.update({
+            "ok": bool(normalized.get("ok", data_available)) and data_available,
+            "healthy": bool(data_available and not auth_required and not partial),
+            "partial": partial,
+            "partial_auth": bool(auth_required and data_available),
+            "auth_required": auth_required,
+            "optional_unavailable": optional_unavailable,
+            "error_code": error_code,
+            "status_label": normalized.get("status_label") or cls._error_label(error_code),
+            "error": redact_log_text(error),
+            "rows": sanitized_rows,
+            "rateData": rate_data,
+        })
+        return normalized
+
+    def _browser_capture_cancelled(self, operation_id, site, window=None):
+        if operation_id != self.browser_operation_id or site != self.site:
+            return True
+        if self.browser_cancel_event.is_set():
+            return True
+        window = window or self.browser_window
+        if window and hasattr(window, "is_cancelled"):
+            try:
+                return bool(window.is_cancelled())
+            except Exception:
+                return True
+        return False
+
+    def _raise_if_browser_capture_cancelled(self, operation_id, site, window=None):
+        if self._browser_capture_cancelled(operation_id, site, window):
+            raise RuntimeError("WINDOW_CLOSED: 登录窗口已关闭或抓取操作已取消")
 
     def _is_site_due(self, record):
         next_run = parse_datetime(record.get("next_run"))
@@ -5137,6 +7402,7 @@ class PriceAppApi:
             item for item in sites or []
             if isinstance(item, dict)
             and (item.get("reauth_required") or item.get("last_status") == "reauth_required")
+            and item.get("auto_refresh", True)
             and item.get("site")
         ]
 
@@ -5230,6 +7496,7 @@ class PriceAppApi:
         remember_credentials=True,
         auto_login=True,
         auto_refresh=True,
+        include_groups=True,
     ):
         saved = load_saved_sites()
         normalized_base = str(api_base or API_BASE).strip() or API_BASE
@@ -5246,11 +7513,17 @@ class PriceAppApi:
             "browser_mode": "webview",
             "interval_minutes": interval,
             "auto_refresh": bool(auto_refresh),
+            "include_groups": bool(include_groups),
             "remember_credentials": bool(remember_credentials),
             "auto_login": bool(auto_login) and bool(remember_credentials),
             "created_at": previous.get("created_at") or now,
             "last_run": previous.get("last_run", ""),
             "last_status": previous.get("last_status", ""),
+            "health_status": previous.get("health_status", "unknown"),
+            "health_label": previous.get("health_label", "尚未检查"),
+            "consecutive_failures": previous.get("consecutive_failures", 0),
+            "last_success_at": previous.get("last_success_at", ""),
+            "last_failure_at": previous.get("last_failure_at", ""),
             "last_error": previous.get("last_error", ""),
             "last_error_code": previous.get("last_error_code", ""),
             "last_status_label": previous.get("last_status_label", ""),
@@ -5258,6 +7531,13 @@ class PriceAppApi:
             "reauth_requested_at": previous.get("reauth_requested_at", ""),
             "last_row_count": previous.get("last_row_count", 0),
             "last_plan_count": previous.get("last_plan_count", 0),
+            "last_group_count": previous.get("last_group_count", 0),
+            "last_exclusive_count": previous.get("last_exclusive_count", 0),
+            "last_user_rate_count": previous.get("last_user_rate_count", 0),
+            "last_core_status": previous.get("last_core_status", ""),
+            "last_enrichment_status": previous.get("last_enrichment_status", ""),
+            "last_enrichment_error": previous.get("last_enrichment_error", ""),
+            "check_history": previous.get("check_history", []),
             "next_run": previous.get("next_run") or datetime.now(timezone.utc).isoformat(),
             "updated_at": now,
         }

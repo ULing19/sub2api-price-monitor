@@ -11,6 +11,8 @@ price-latest.json
 price-latest.csv
 price-changes.json
 price-change-baselines.json
+notification-settings.json
+notification-logs.json
 price-history/
 price-webview-profile/
 chrome-profiles/

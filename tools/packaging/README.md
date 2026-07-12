@@ -12,6 +12,8 @@
 - `price-latest.csv`
 - `price-changes.json`
 - `price-change-baselines.json`
+- `notification-settings.json`
+- `notification-logs.json`
 - `price-history/`
 - `price-webview-profile/`
 - `chrome-profiles/`
@@ -24,14 +26,14 @@
 %LOCALAPPDATA%\Sub2APIPriceMonitor
 ```
 
-因此你本机保存过的站点、登录状态、变化记录、对比基线和历史价格不会进入发行版；其他人打开后会从空配置开始使用。
+因此你本机保存过的站点、登录状态、SMTP 通知设置、变化记录、对比基线和历史价格不会进入发行版；其他人打开后会从空配置开始使用。站点密码和 SMTP 密码只保存在当前 Windows 用户的凭据管理器中，也不会进入发行包。
 
 ## 构建
 
 在仓库根目录运行：
 
 ```powershell
-.\tools\packaging\build_price_app.ps1 -Version 1.1.0
+.\tools\packaging\build_price_app.ps1 -Version 1.2.0
 ```
 
 构建脚本会校验 `APP_VERSION` 与传入版本一致，并把产品名称和版本号写入 Windows EXE 文件属性。版本不一致时会直接停止构建，避免误发旧二进制。
