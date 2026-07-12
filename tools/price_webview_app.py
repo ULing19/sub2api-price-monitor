@@ -71,7 +71,7 @@ OUTPUT_FIELDS = [
 
 
 APP_NAME = "Sub2APIPriceMonitor"
-APP_VERSION = "0.1.9"
+APP_VERSION = "0.1.10"
 APP_WINDOW_TITLE = "Sub2API 中转站比价"
 LOGGER = logging.getLogger(APP_NAME)
 SHUTDOWN_JOIN_TIMEOUT_SECONDS = 1.0
@@ -111,6 +111,8 @@ APP_MUTEX_NAME = f"Local\\{APP_NAME}.SingleInstance"
 _APP_MUTEX_HANDLE = None
 MAX_SITE_WORKERS = 2
 WINDOW_LOCK_TIMEOUT_SECONDS = 0.5
+WINDOW_INITIALIZE_TIMEOUT_SECONDS = 15
+INTERACTIVE_RELOGIN_WAIT_SECONDS = 5
 
 
 class AppShutdownRequested(RuntimeError):
@@ -2334,6 +2336,7 @@ class PriceAppApi:
     def attach_browser_window(self, window):
         self.browser_window = window
         if window:
+            window.events.closing += self._on_browser_closing
             window.events.closed += self._on_browser_closed
         return window
 
@@ -2346,6 +2349,18 @@ class PriceAppApi:
                 )
             )
         return window
+
+    def _on_browser_closing(self, window=None):
+        if self.shutdown_event.is_set():
+            return None
+        if window is None or window is self.browser_window:
+            self.browser_cancel_event.set()
+            threading.Thread(
+                target=self._hide_browser_window,
+                name="hide-login-window",
+                daemon=True,
+            ).start()
+        return False
 
     def _on_browser_closed(self, window=None):
         if window is None or window is self.browser_window:
@@ -2504,40 +2519,27 @@ class PriceAppApi:
         self.worker_windows[slot] = None
         return False
 
+    @staticmethod
+    def _wait_window_initialized(window, timeout=WINDOW_INITIALIZE_TIMEOUT_SECONDS):
+        initialized_event = getattr(getattr(window, "events", None), "initialized", None)
+        if initialized_event and not initialized_event.wait(timeout):
+            raise RuntimeError("WebView 窗口初始化超时，请重启应用")
+
     def _ensure_browser_window(self, url=None, visible=False):
         self._raise_if_shutting_down()
         if not self.browser_lock.acquire(timeout=WINDOW_LOCK_TIMEOUT_SECONDS):
             raise RuntimeError("WebView 窗口正在切换，请稍后重试")
-        created = False
         try:
             self._raise_if_shutting_down()
             if not self._browser_alive():
-                self.browser_cancel_event.clear()
-                self.browser_operation_id += 1
-                created_window = webview.create_window(
-                    "目标站点 WebView 登录",
-                    url=url or BLANK_PAGE,
-                    js_api=self.credential_bridge,
-                    width=1120,
-                    height=820,
-                    min_size=(760, 520),
-                    hidden=not visible,
-                    focus=visible,
-                    text_select=True,
-                )
-                if self.shutdown_event.is_set():
-                    try:
-                        created_window.destroy()
-                    finally:
-                        self._raise_if_shutting_down()
-                self.attach_browser_window(created_window)
-                created = True
+                raise RuntimeError("登录 WebView 已不可用，请重启应用")
             window = self.browser_window
         finally:
             self.browser_lock.release()
 
         try:
-            if url and not created:
+            self._wait_window_initialized(window)
+            if url:
                 self.browser_cancel_event.clear()
                 self.browser_operation_id += 1
                 window.load_url(url)
@@ -2560,30 +2562,25 @@ class PriceAppApi:
 
     def _ensure_worker_window(self, slot, url=None):
         self._raise_if_shutting_down()
-        with self.worker_window_lock:
+        if not self.worker_window_lock.acquire(timeout=WINDOW_LOCK_TIMEOUT_SECONDS):
+            raise RuntimeError("后台 WebView 正在切换，请稍后重试")
+        try:
             self._raise_if_shutting_down()
             if not self._worker_alive(slot):
-                created_window = webview.create_window(
-                    f"后台价格抓取 {slot + 1}",
-                    url=url or BLANK_PAGE,
-                    width=960,
-                    height=720,
-                    min_size=(640, 480),
-                    hidden=True,
-                    focus=False,
-                    text_select=False,
-                )
-                if self.shutdown_event.is_set():
-                    try:
-                        created_window.destroy()
-                    finally:
-                        self._raise_if_shutting_down()
-                self.attach_worker_window(created_window, slot)
+                raise RuntimeError(f"后台 WebView {slot + 1} 已不可用，请重启应用")
             window = self.worker_windows[slot]
+        finally:
+            self.worker_window_lock.release()
+        self._wait_window_initialized(window)
+        try:
             if url:
                 window.load_url(url)
                 self._raise_if_shutting_down()
             return window
+        except Exception:
+            if window is self.worker_windows[slot]:
+                self.worker_windows[slot] = None
+            raise
 
     def _hide_browser_window(self):
         if not self.browser_window:
@@ -2773,7 +2770,7 @@ class PriceAppApi:
     def open_site(self, site):
         if self.shutdown_event.is_set():
             return {"ok": False, "shutting_down": True, "error": "应用正在退出"}
-        if not self.interactive_operation_lock.acquire(blocking=False):
+        if not self.interactive_operation_lock.acquire(timeout=INTERACTIVE_RELOGIN_WAIT_SECONDS):
             return {"ok": False, "busy": True, "error": "登录窗口正在抓取，请稍后再试"}
         try:
             self._raise_if_shutting_down()
@@ -3838,6 +3835,30 @@ def main():
             text_select=True,
         )
         api.attach_controller_window(controller)
+        browser = webview.create_window(
+            "目标站点 WebView 登录",
+            url=BLANK_PAGE,
+            js_api=api.credential_bridge,
+            width=1120,
+            height=820,
+            min_size=(760, 520),
+            hidden=True,
+            focus=False,
+            text_select=True,
+        )
+        api.attach_browser_window(browser)
+        for slot in range(MAX_SITE_WORKERS):
+            worker = webview.create_window(
+                f"后台价格抓取 {slot + 1}",
+                url=BLANK_PAGE,
+                width=960,
+                height=720,
+                min_size=(640, 480),
+                hidden=True,
+                focus=False,
+                text_select=False,
+            )
+            api.attach_worker_window(worker, slot)
 
         webview.start(
             gui="edgechromium",

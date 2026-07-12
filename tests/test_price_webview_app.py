@@ -33,6 +33,9 @@ class FakeEvent:
     def is_set(self):
         return self.value
 
+    def wait(self, timeout=None):
+        return self.value
+
     def __iadd__(self, handler):
         self.handlers.append(handler)
         return self
@@ -41,10 +44,15 @@ class FakeEvent:
 class FakeBrowserWindow(FakeWindow):
     def __init__(self, closed=False):
         super().__init__()
-        self.events = types.SimpleNamespace(closed=FakeEvent(closed))
+        self.events = types.SimpleNamespace(
+            initialized=FakeEvent(True),
+            closing=FakeEvent(),
+            closed=FakeEvent(closed),
+        )
         self.load_urls = []
         self.show_count = 0
         self.restore_count = 0
+        self.hide_count = 0
         self.url_probe_count = 0
 
     def get_current_url(self):
@@ -59,6 +67,9 @@ class FakeBrowserWindow(FakeWindow):
 
     def restore(self):
         self.restore_count += 1
+
+    def hide(self):
+        self.hide_count += 1
 
 
 class PriceAppLifecycleTests(unittest.TestCase):
@@ -203,19 +214,39 @@ class PriceAppLifecycleTests(unittest.TestCase):
         self.assertFalse(api._window_alive(window))
         self.assertEqual(window.url_probe_count, 0)
 
-    def test_relogin_recreates_closed_window_without_duplicate_navigation(self):
+    def test_relogin_reuses_precreated_window(self):
         api = self.new_api()
-        api.browser_window = FakeBrowserWindow(closed=True)
-        created = FakeBrowserWindow()
+        browser = FakeBrowserWindow()
+        api.attach_browser_window(browser)
 
-        with mock.patch.object(app.webview, "create_window", return_value=created) as create_window:
+        with mock.patch.object(app.webview, "create_window") as create_window:
             result = api._ensure_browser_window("https://example.com", visible=True)
 
-        self.assertIs(result, created)
-        create_window.assert_called_once()
-        self.assertEqual(created.load_urls, [])
-        self.assertEqual(created.show_count, 1)
-        self.assertEqual(created.restore_count, 1)
+        self.assertIs(result, browser)
+        create_window.assert_not_called()
+        self.assertEqual(browser.load_urls, ["https://example.com"])
+        self.assertEqual(browser.show_count, 1)
+        self.assertEqual(browser.restore_count, 1)
+
+    def test_closing_login_window_hides_it_for_reuse(self):
+        api = self.new_api()
+        browser = FakeBrowserWindow()
+        api.attach_browser_window(browser)
+
+        self.assertFalse(api._on_browser_closing(browser))
+        self.assertTrue(api.browser_cancel_event.is_set())
+        self.assertIs(api.browser_window, browser)
+        deadline = time.monotonic() + 1
+        while browser.hide_count == 0 and time.monotonic() < deadline:
+            time.sleep(0.01)
+        self.assertEqual(browser.hide_count, 1)
+
+    def test_missing_login_window_fails_without_dynamic_creation(self):
+        api = self.new_api()
+        with mock.patch.object(app.webview, "create_window") as create_window:
+            with self.assertRaisesRegex(RuntimeError, "已不可用"):
+                api._ensure_browser_window("https://example.com", visible=True)
+        create_window.assert_not_called()
 
     def test_relogin_does_not_wait_forever_for_window_lock(self):
         api = self.new_api()
@@ -230,6 +261,23 @@ class PriceAppLifecycleTests(unittest.TestCase):
             self.assertEqual(api.site, "https://old.example")
         finally:
             api.browser_lock.release()
+
+    def test_relogin_waits_for_cancelled_credential_helper(self):
+        api = self.new_api()
+        browser = FakeBrowserWindow()
+        api.attach_browser_window(browser)
+        api.interactive_operation_lock.acquire()
+
+        def release_helper_lock():
+            time.sleep(0.05)
+            api.interactive_operation_lock.release()
+
+        threading.Thread(target=release_helper_lock, daemon=True).start()
+        result = api.open_site("https://new.example")
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["site"], "https://new.example")
+        self.assertEqual(browser.load_urls, ["https://new.example"])
 
     def test_interactive_capture_uses_a_daemon_job(self):
         api = self.new_api()
