@@ -88,7 +88,7 @@ OUTPUT_FIELDS = [
 
 
 APP_NAME = "Sub2APIPriceMonitor"
-APP_VERSION = "1.2.1"
+APP_VERSION = "1.2.2"
 APP_WINDOW_TITLE = "Sub2API 中转站比价"
 LOGGER = logging.getLogger(APP_NAME)
 SHUTDOWN_JOIN_TIMEOUT_SECONDS = 3.0
@@ -144,6 +144,11 @@ WINDOW_INITIALIZE_TIMEOUT_SECONDS = 15
 INTERACTIVE_RELOGIN_WAIT_SECONDS = 5
 BROWSER_HOST_START_TIMEOUT_SECONDS = 30
 BROWSER_IPC_TIMEOUT_SECONDS = 12
+BROWSER_VISIBILITY_IPC_TIMEOUT_SECONDS = 2
+BROWSER_WINDOW_LOCK_WAIT_SECONDS = 3
+BROWSER_HIDE_COMPLETION_TIMEOUT_SECONDS = 70
+BROWSER_HIDE_STATUS_POLL_SECONDS = 0.2
+LOGIN_HOST_PROTECTION_SECONDS = 1800
 
 
 class AppShutdownRequested(RuntimeError):
@@ -4254,23 +4259,11 @@ CONTROL_HTML = r"""<!doctype html>
       }
       loginOpenBusy = true;
       openSiteBtn.disabled = true;
-      let timeoutId = null;
       try {
-        const timeout = new Promise((resolve) => {
-          timeoutId = setTimeout(() => resolve({
-            ok: false,
-            timeout: true,
-            error: '打开登录窗口超时，请再次点击 WebView登录。',
-          }), 20000);
-        });
-        return await Promise.race([
-          window.pywebview.api.open_site(site),
-          timeout,
-        ]);
+        return await window.pywebview.api.open_site(site);
       } catch (error) {
         return { ok: false, error: String(error?.message || error || '打开登录窗口失败') };
       } finally {
-        if (timeoutId) clearTimeout(timeoutId);
         loginOpenBusy = false;
         openSiteBtn.disabled = false;
       }
@@ -4460,7 +4453,7 @@ CONTROL_HTML = r"""<!doctype html>
           setTimeout(startNextReauth, 500);
         }
         setState('已暂时跳过本站');
-        log('登录窗口已收起；本站在本轮更新中不会再次自动弹出。');
+        log('登录窗口正在收起；本站在本轮更新中不会再次自动弹出。');
       } finally {
         hideLoginBtn.disabled = false;
       }
@@ -4874,7 +4867,9 @@ class RemoteWindow:
         })()
 
     def load_url(self, url):
-        self.manager.call("load_url", self.name, {"url": url})
+        result = self.manager.call("load_url", self.name, {"url": url})
+        self._raise_if_stale_activation(result)
+        return result
 
     def get_current_url(self):
         return self.manager.call("get_current_url", self.name) or ""
@@ -4908,18 +4903,92 @@ class RemoteWindow:
         return True
 
     def show(self):
-        self.manager.call("show", self.name)
+        result = self.manager.call(
+            "show",
+            self.name,
+            timeout=BROWSER_VISIBILITY_IPC_TIMEOUT_SECONDS,
+        )
+        self._raise_if_stale_activation(result)
+        return result
 
     def restore(self):
-        self.manager.call("restore", self.name)
+        result = self.manager.call(
+            "restore",
+            self.name,
+            timeout=BROWSER_VISIBILITY_IPC_TIMEOUT_SECONDS,
+        )
+        self._raise_if_stale_activation(result)
+        return result
 
     def hide(self):
-        self.manager.call("hide", self.name)
+        scheduled = self.manager.call(
+            "hide",
+            self.name,
+            timeout=BROWSER_VISIBILITY_IPC_TIMEOUT_SECONDS,
+        )
+        if self.name != "login" or not isinstance(scheduled, dict):
+            return bool(scheduled)
+        return self._wait_for_login_hide(scheduled)
+
+    def _wait_for_login_hide(self, scheduled):
+        status = str(scheduled.get("status") or "")
+        if status == "superseded":
+            return False
+        request_id = int(scheduled.get("request_id") or 0)
+        if request_id <= 0:
+            raise RuntimeError("登录窗口隐藏请求未被 WebView 宿主接受")
+        deadline = time.monotonic() + BROWSER_HIDE_COMPLETION_TIMEOUT_SECONDS + 2
+        while time.monotonic() < deadline:
+            result = self.manager.call(
+                "get_hide_status",
+                self.name,
+                {"request_id": request_id},
+                timeout=1.5,
+            )
+            status = str((result or {}).get("status") or "")
+            if status == "hidden":
+                return True
+            if status == "superseded":
+                return False
+            if status == "failed":
+                raise RuntimeError(str(result.get("error") or "登录窗口隐藏失败"))
+            time.sleep(BROWSER_HIDE_STATUS_POLL_SECONDS)
+        raise TimeoutError("等待登录窗口隐藏超时")
 
     def is_cancelled(self):
         if self.name != "login":
             return False
-        return bool(self.manager.call("get_cancelled", self.name))
+        state = self.manager.call("get_login_state", self.name, timeout=1.5)
+        return bool((state or {}).get("cancelled"))
+
+    def cancel_activation(self):
+        if self.name != "login":
+            return False
+        scheduled = self.manager.call(
+            "cancel_activation",
+            self.name,
+            timeout=BROWSER_VISIBILITY_IPC_TIMEOUT_SECONDS,
+        )
+        if not isinstance(scheduled, dict) or scheduled.get("status") == "superseded":
+            return scheduled
+
+        def monitor_hide():
+            try:
+                self._wait_for_login_hide(scheduled)
+            except Exception as exc:
+                LOGGER.warning("Unable to hide cancelled login activation: %s", exc)
+
+        threading.Thread(
+            target=monitor_hide,
+            name="monitor-cancelled-login-hide",
+            daemon=True,
+        ).start()
+        return scheduled
+
+    @staticmethod
+    def _raise_if_stale_activation(result):
+        if isinstance(result, dict) and result.get("stale"):
+            raise RuntimeError("WINDOW_CLOSED: 登录窗口操作已被更新请求取代")
 
     def destroy(self):
         return None
@@ -4935,6 +5004,11 @@ class BrowserProcessManager:
         self.opener = build_opener(ProxyHandler({}))
         self.lock = threading.RLock()
         self.generation = 0
+        self.login_protection_deadline = 0.0
+        self.login_protection_generation = None
+        self.login_activation_sequence = 0
+        self.login_active_activation_id = None
+        self.command_failures = {}
 
     @staticmethod
     def _free_port():
@@ -4979,6 +5053,7 @@ class BrowserProcessManager:
                 self.generation += 1
                 LOGGER.info("Started isolated WebView host generation=%s pid=%s", self.generation, self.process.pid)
             process = self.process
+            generation = self.generation
 
         deadline = time.monotonic() + max(1.0, timeout)
         last_error = ""
@@ -4994,15 +5069,52 @@ class BrowserProcessManager:
             except Exception as exc:
                 last_error = str(exc)
                 time.sleep(0.2)
-        self.mark_failed("startup_timeout")
+        with self.lock:
+            if (
+                self.generation == generation
+                and self.process is process
+                and process.poll() is None
+            ):
+                if self.ready_pid == process.pid:
+                    return
+                try:
+                    self._request({"command": "ping"}, timeout=1)
+                except Exception as exc:
+                    last_error = str(exc)
+                    self.mark_failed("startup_timeout", expected_generation=generation)
+                else:
+                    self.ready_pid = process.pid
+                    return
         raise RuntimeError(f"WebView 子进程启动超时：{last_error}")
 
     def call(self, command, window=None, payload=None, timeout=BROWSER_IPC_TIMEOUT_SECONDS):
+        login_activation = window == "login" and command in {"load_url", "show", "restore"}
         self.ensure_started()
+        with self.lock:
+            generation = self.generation
+            request_payload_data = dict(payload or {})
+            if login_activation:
+                if command == "load_url" or self.login_active_activation_id is None:
+                    self.login_activation_sequence += 1
+                    self.login_active_activation_id = self.login_activation_sequence
+                request_payload_data["_activation_id"] = self.login_active_activation_id
+            elif window == "login" and command in {"hide", "cancel_activation"}:
+                if self.login_active_activation_id is not None:
+                    request_payload_data["_activation_id"] = self.login_active_activation_id
+            if command in {"load_url", "get_current_url", "evaluate_js", "show", "restore"}:
+                request_payload_data.setdefault(
+                    "_lock_timeout",
+                    max(
+                        0.1,
+                        min(BROWSER_WINDOW_LOCK_WAIT_SECONDS, float(timeout) - 0.5),
+                    ),
+                )
+        if login_activation:
+            self._set_login_protection(True, expected_generation=generation)
         request_payload = {
             "command": command,
             "window": window or "",
-            "payload": payload or {},
+            "payload": request_payload_data,
         }
         started = time.monotonic()
         try:
@@ -5013,6 +5125,33 @@ class BrowserProcessManager:
                 window or "",
                 time.monotonic() - started,
             )
+            with self.lock:
+                self.command_failures.pop((generation, window or ""), None)
+            if window == "login":
+                stale = isinstance(result, dict) and bool(result.get("stale"))
+                hidden = bool(
+                    isinstance(result, dict)
+                    and (
+                        (command == "get_hide_status" and result.get("status") == "hidden")
+                        or (
+                            command == "get_login_state"
+                            and result.get("cancelled")
+                            and result.get("hidden")
+                        )
+                    )
+                )
+                if hidden:
+                    self._clear_login_protection_for_activation(
+                        result.get("activation_id"),
+                        generation,
+                    )
+                elif login_activation and not stale:
+                    self._set_login_protection(True, expected_generation=generation)
+                elif (
+                    command in {"get_current_url", "evaluate_js"}
+                    and self._login_protection_active(expected_generation=generation)
+                ):
+                    self._set_login_protection(True, expected_generation=generation)
             return result
         except Exception as exc:
             LOGGER.warning(
@@ -5022,8 +5161,98 @@ class BrowserProcessManager:
                 time.monotonic() - started,
                 exc,
             )
-            self.mark_failed(f"{command}_failed")
-            raise RuntimeError(f"WebView 子进程无响应，已自动重启：{exc}") from exc
+            health = self._host_health(generation)
+            login_protected = self._login_protection_active(expected_generation=generation)
+            if health == "replaced":
+                action = "已忽略过期故障"
+            elif login_protected and health != "dead":
+                action = "登录窗口保持打开"
+                LOGGER.warning(
+                    "Preserving WebView host generation=%s after %s failure because login is active",
+                    generation,
+                    command,
+                )
+            elif health == "responsive":
+                with self.lock:
+                    failure_key = (generation, window or "")
+                    failure_count = self.command_failures.get(failure_key, 0) + 1
+                    self.command_failures[failure_key] = failure_count
+                if failure_count < 2:
+                    action = "宿主仍在线，未执行重启"
+                else:
+                    recycled = self.mark_failed(
+                        f"{command}_repeated_failure",
+                        expected_generation=generation,
+                    )
+                    action = "连续超时，已安排重启" if recycled else "已忽略过期故障"
+            else:
+                recycled = self.mark_failed(
+                    f"{command}_failed",
+                    expected_generation=generation,
+                )
+                action = "已安排重启" if recycled else "已忽略过期故障"
+            raise RuntimeError(f"WebView 子进程无响应，{action}：{exc}") from exc
+
+    def _set_login_protection(self, enabled, expected_generation=None):
+        with self.lock:
+            if expected_generation is not None and self.generation != expected_generation:
+                return False
+            self.login_protection_deadline = (
+                time.monotonic() + LOGIN_HOST_PROTECTION_SECONDS
+                if enabled else 0.0
+            )
+            self.login_protection_generation = self.generation if enabled else None
+            return True
+
+    def _clear_login_protection_for_activation(self, activation_id, expected_generation):
+        with self.lock:
+            if self.generation != expected_generation:
+                return False
+            try:
+                activation_id = int(activation_id or 0)
+            except (TypeError, ValueError):
+                activation_id = 0
+            if (
+                self.login_active_activation_id is not None
+                and self.login_active_activation_id != activation_id
+            ):
+                return False
+            self.login_active_activation_id = None
+            self.login_protection_deadline = 0.0
+            self.login_protection_generation = None
+            return True
+
+    def _login_protection_active(self, expected_generation=None):
+        with self.lock:
+            if expected_generation is not None and self.generation != expected_generation:
+                return False
+            if self.login_protection_generation != self.generation:
+                self.login_protection_deadline = 0.0
+                self.login_protection_generation = None
+                return False
+            if self.login_protection_deadline <= 0:
+                return False
+            if time.monotonic() >= self.login_protection_deadline:
+                self.login_protection_deadline = 0.0
+                self.login_protection_generation = None
+                return False
+            return True
+
+    def _host_health(self, expected_generation):
+        with self.lock:
+            if self.generation != expected_generation:
+                return "replaced"
+            process = self.process
+            if not process or process.poll() is not None:
+                return "dead"
+        try:
+            self._request({"command": "ping"}, timeout=1)
+        except Exception:
+            return "unresponsive"
+        with self.lock:
+            if self.generation != expected_generation:
+                return "replaced"
+        return "responsive"
 
     def _request(self, payload, timeout):
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -5045,15 +5274,28 @@ class BrowserProcessManager:
             raise RuntimeError(result.get("error") or "WebView 子进程调用失败")
         return result.get("result")
 
-    def mark_failed(self, reason):
+    def mark_failed(self, reason, expected_generation=None):
         with self.lock:
+            if expected_generation is not None and self.generation != expected_generation:
+                LOGGER.info(
+                    "Ignoring stale WebView host failure reason=%s expected_generation=%s current_generation=%s",
+                    reason,
+                    expected_generation,
+                    self.generation,
+                )
+                return False
             LOGGER.warning("Recycling isolated WebView host: %s", reason)
             self._terminate_locked()
+            return True
 
     def _terminate_locked(self):
         process = self.process
         self.process = None
         self.ready_pid = None
+        self.login_protection_deadline = 0.0
+        self.login_protection_generation = None
+        self.login_active_activation_id = None
+        self.command_failures.clear()
         if not process:
             return
         try:
@@ -5114,22 +5356,171 @@ class BrowserHostRuntime:
         self.storage_path = pathlib.Path(storage_path)
         self.credential_bridge = BrowserHostCredentialBridge()
         self.windows = {}
+        self.window_locks = {}
         self.server = None
         self.shutting_down = threading.Event()
         self.login_cancelled = threading.Event()
+        self.login_visibility_lock = threading.RLock()
+        self.login_visibility_generation = 0
+        self.login_latest_activation_id = 0
+        self.login_cancelled_through_activation_id = 0
+        self.login_hidden = True
+        self.login_hide_sequence = 0
+        self.login_hide_statuses = {}
 
     def attach_windows(self, login, workers):
         self.windows["login"] = login
         for slot, worker in enumerate(workers):
             self.windows[f"worker-{slot}"] = worker
+        self.window_locks = {
+            name: threading.RLock() for name in self.windows
+        }
         login.events.closing += self._on_login_closing
 
     def _on_login_closing(self, window=None):
         if self.shutting_down.is_set():
             return None
-        self.login_cancelled.set()
-        threading.Thread(target=self.windows["login"].hide, daemon=True).start()
+        self._schedule_login_hide()
         return False
+
+    def _schedule_login_hide(self, expected_activation_id=None):
+        with self.login_visibility_lock:
+            if (
+                expected_activation_id is not None
+                and expected_activation_id < self.login_latest_activation_id
+            ):
+                return {
+                    "request_id": 0,
+                    "status": "superseded",
+                    "activation_id": expected_activation_id,
+                    "hidden": self.login_hidden,
+                }
+            if (
+                expected_activation_id is not None
+                and expected_activation_id > self.login_latest_activation_id
+            ):
+                self.login_latest_activation_id = expected_activation_id
+            self.login_cancelled.set()
+            self.login_cancelled_through_activation_id = max(
+                self.login_cancelled_through_activation_id,
+                self.login_latest_activation_id,
+            )
+            self.login_visibility_generation += 1
+            hide_generation = self.login_visibility_generation
+            self.login_hide_sequence += 1
+            request_id = self.login_hide_sequence
+            activation_id = self.login_latest_activation_id
+            self.login_hide_statuses[request_id] = {
+                "request_id": request_id,
+                "status": "pending",
+                "activation_id": activation_id,
+                "hidden": self.login_hidden,
+                "error": "",
+            }
+            for stale_request_id in sorted(self.login_hide_statuses)[:-20]:
+                self.login_hide_statuses.pop(stale_request_id, None)
+
+        def hide_when_idle():
+            window = self.windows.get("login")
+            window_lock = self.window_locks.get("login")
+            if not window or not window_lock:
+                self._complete_login_hide(request_id, "failed", "登录 WebView 不可用")
+                return
+            acquired = window_lock.acquire(timeout=BROWSER_HIDE_COMPLETION_TIMEOUT_SECONDS)
+            if not acquired:
+                self._complete_login_hide(request_id, "failed", "等待登录 WebView 空闲超时")
+                return
+            try:
+                with self.login_visibility_lock:
+                    should_hide = (
+                        hide_generation == self.login_visibility_generation
+                        and self.login_cancelled.is_set()
+                        and not self.shutting_down.is_set()
+                    )
+                if not should_hide:
+                    self._complete_login_hide(request_id, "superseded")
+                    return
+                try:
+                    window.hide()
+                except Exception as exc:
+                    LOGGER.warning("Unable to hide login WebView in browser host: %s", exc)
+                    self._complete_login_hide(request_id, "failed", str(exc))
+                    return
+                with self.login_visibility_lock:
+                    if (
+                        hide_generation == self.login_visibility_generation
+                        and self.login_cancelled.is_set()
+                    ):
+                        self.login_hidden = True
+                        self._complete_login_hide(request_id, "hidden")
+                    else:
+                        self._complete_login_hide(request_id, "superseded")
+            finally:
+                window_lock.release()
+
+        threading.Thread(
+            target=hide_when_idle,
+            name="browser-host-hide-login",
+            daemon=True,
+        ).start()
+        with self.login_visibility_lock:
+            return dict(self.login_hide_statuses[request_id])
+
+    def _complete_login_hide(self, request_id, status, error=""):
+        with self.login_visibility_lock:
+            current = self.login_hide_statuses.get(request_id)
+            if not current:
+                return
+            current.update({
+                "status": status,
+                "hidden": self.login_hidden,
+                "error": str(error or ""),
+            })
+
+    def _login_hide_status(self, request_id):
+        with self.login_visibility_lock:
+            result = self.login_hide_statuses.get(int(request_id or 0))
+            if not result:
+                return {
+                    "request_id": int(request_id or 0),
+                    "status": "failed",
+                    "activation_id": self.login_latest_activation_id,
+                    "hidden": self.login_hidden,
+                    "error": "登录窗口隐藏请求不存在或已过期",
+                }
+            return dict(result)
+
+    def _login_state(self):
+        with self.login_visibility_lock:
+            return {
+                "cancelled": self.login_cancelled.is_set(),
+                "hidden": self.login_hidden,
+                "activation_id": self.login_latest_activation_id,
+                "hide_request_id": self.login_hide_sequence,
+            }
+
+    def _register_login_activation(self, payload):
+        try:
+            activation_id = int(payload.get("_activation_id") or 0)
+        except (TypeError, ValueError):
+            activation_id = 0
+        with self.login_visibility_lock:
+            if activation_id <= 0:
+                activation_id = self.login_latest_activation_id + 1
+            if activation_id > self.login_latest_activation_id:
+                self.login_latest_activation_id = activation_id
+                self.login_visibility_generation += 1
+                if activation_id > self.login_cancelled_through_activation_id:
+                    self.login_cancelled.clear()
+                    self.login_hidden = False
+            return activation_id
+
+    def _login_activation_current(self, activation_id):
+        with self.login_visibility_lock:
+            return bool(
+                activation_id == self.login_latest_activation_id
+                and activation_id > self.login_cancelled_through_activation_id
+            )
 
     def execute(self, request):
         command = request.get("command")
@@ -5143,17 +5534,62 @@ class BrowserHostRuntime:
         if not window:
             raise RuntimeError(f"未知 WebView 窗口：{name}")
         payload = request.get("payload") or {}
+        if command == "get_cancelled":
+            return bool(name == "login" and self.login_cancelled.is_set())
+        if command == "get_login_state" and name == "login":
+            return self._login_state()
+        if command == "get_hide_status" and name == "login":
+            return self._login_hide_status(payload.get("request_id"))
+        expected_activation_id = None
+        if name == "login" and command in {"hide", "cancel_activation"}:
+            try:
+                expected_activation_id = int(payload.get("_activation_id") or 0) or None
+            except (TypeError, ValueError):
+                expected_activation_id = None
+        if command == "hide" and name == "login":
+            return self._schedule_login_hide(expected_activation_id)
+        if command == "cancel_activation" and name == "login":
+            return self._schedule_login_hide(expected_activation_id)
+        activation_id = None
+        if name == "login" and command in {"load_url", "show", "restore"}:
+            activation_id = self._register_login_activation(payload)
+        if command in {"load_url", "get_current_url", "evaluate_js", "show", "restore", "hide"}:
+            try:
+                lock_timeout = max(
+                    0.1,
+                    min(
+                        BROWSER_WINDOW_LOCK_WAIT_SECONDS,
+                        float(payload.get("_lock_timeout") or BROWSER_WINDOW_LOCK_WAIT_SECONDS),
+                    ),
+                )
+            except (TypeError, ValueError):
+                lock_timeout = BROWSER_WINDOW_LOCK_WAIT_SECONDS
+            window_lock = self.window_locks[name]
+            if not window_lock.acquire(timeout=lock_timeout):
+                raise TimeoutError("WebView 窗口仍在执行上一项操作")
+            try:
+                if activation_id is not None and not self._login_activation_current(activation_id):
+                    return {"stale": True, "activation_id": activation_id}
+                result = self._execute_window_command(command, name, window, payload)
+                if activation_id is not None:
+                    with self.login_visibility_lock:
+                        if self._login_activation_current(activation_id):
+                            self.login_cancelled.clear()
+                            self.login_hidden = False
+                return result
+            finally:
+                window_lock.release()
+        return self._execute_window_command(command, name, window, payload)
+
+    def _execute_window_command(self, command, name, window, payload):
         if command == "load_url":
             url = str(payload.get("url") or BLANK_PAGE)
+            window.load_url(url)
             if name == "login":
                 self.credential_bridge.site = normalize_site(url) if url != BLANK_PAGE else ""
-                self.login_cancelled.clear()
-            window.load_url(url)
             return True
         if command == "get_current_url":
             return window.get_current_url() or ""
-        if command == "get_cancelled":
-            return bool(name == "login" and self.login_cancelled.is_set())
         if command == "show":
             window.show()
             return True
@@ -5535,11 +5971,13 @@ class PriceAppApi:
         finally:
             self.browser_lock.release()
 
+        activation_started = False
         try:
             self._wait_window_initialized(window)
             if url:
                 self.browser_cancel_event.clear()
                 self.browser_operation_id += 1
+                activation_started = True
                 LOGGER.info(
                     "Login WebView navigation operation=%s host=%s",
                     self.browser_operation_id,
@@ -5548,19 +5986,25 @@ class PriceAppApi:
                 window.load_url(url)
                 self._raise_if_shutting_down()
             if visible:
-                try:
-                    window.show()
-                except Exception:
-                    pass
-                try:
-                    window.restore()
-                except Exception:
-                    pass
+                visibility_errors = []
+                visibility_succeeded = False
+                for action_name in ("show", "restore"):
+                    try:
+                        getattr(window, action_name)()
+                        visibility_succeeded = True
+                    except Exception as exc:
+                        visibility_errors.append(f"{action_name}: {exc}")
+                if not visibility_succeeded:
+                    raise RuntimeError(
+                        "登录 WebView 无法显示：" + "; ".join(visibility_errors)
+                    )
             return window
         except Exception:
-            if window is self.browser_window:
-                self.browser_cancel_event.set()
-                self.browser_window = None
+            if activation_started and hasattr(window, "cancel_activation"):
+                try:
+                    window.cancel_activation()
+                except Exception as exc:
+                    LOGGER.warning("Unable to cancel failed login activation: %s", exc)
             raise
 
     def _ensure_worker_window(self, slot, url=None):
@@ -5582,8 +6026,6 @@ class PriceAppApi:
                 self._raise_if_shutting_down()
             return window
         except Exception:
-            if window is self.worker_windows[slot]:
-                self.worker_windows[slot] = None
             raise
 
     def _hide_browser_window(self, operation_id=None):
@@ -5593,8 +6035,8 @@ class PriceAppApi:
             return
         try:
             self.browser_window.hide()
-        except Exception:
-            self.browser_window = None
+        except Exception as exc:
+            LOGGER.warning("Unable to hide login WebView; preserving remote handle: %s", exc)
 
     @staticmethod
     def _idle_update_job():
@@ -6170,7 +6612,12 @@ class PriceAppApi:
             name="hide-login-window",
             daemon=True,
         ).start()
-        return {"ok": True, "hidden": True, "site": self.site}
+        return {
+            "ok": True,
+            "hidden": False,
+            "hide_requested": True,
+            "site": self.site,
+        }
 
     def start_capture_prices(self, api_base=API_BASE, include_groups=True, close_browser=True):
         if self.shutdown_event.is_set():
@@ -7053,11 +7500,12 @@ class PriceAppApi:
             return {"loginForm": False}
 
     def _wait_for_auto_login(self, site, window, allow_save=False, timeout=15):
+        login_operation_id = self.browser_operation_id if window is self.browser_window else None
         deadline = time.time() + timeout
         while time.time() < deadline:
             self._raise_if_shutting_down()
-            if window is self.browser_window and self.browser_cancel_event.is_set():
-                raise RuntimeError("WINDOW_CLOSED: 登录窗口已关闭")
+            if login_operation_id is not None:
+                self._raise_if_browser_capture_cancelled(login_operation_id, site, window)
             if self._detect_cloudflare_challenge(window):
                 raise RuntimeError("CLOUDFLARE_CHALLENGE: Cloudflare 验证未完成或当前环境不兼容")
             time.sleep(0.5)
@@ -7072,13 +7520,14 @@ class PriceAppApi:
         self._raise_if_shutting_down()
         if not window:
             raise RuntimeError("WebView 窗口不可用")
+        login_operation_id = self.browser_operation_id if window is self.browser_window else None
         expected_origin = urlparse(site).netloc
         deadline = time.time() + timeout
         last_error = ""
         while time.time() < deadline:
             self._raise_if_shutting_down()
-            if window is self.browser_window and self.browser_cancel_event.is_set():
-                raise RuntimeError("WINDOW_CLOSED: 登录窗口已关闭")
+            if login_operation_id is not None:
+                self._raise_if_browser_capture_cancelled(login_operation_id, site, window)
             try:
                 current_url = window.get_current_url()
                 current_host = urlparse(current_url).netloc
@@ -7090,7 +7539,11 @@ class PriceAppApi:
                     return
             except Exception as exc:
                 last_error = str(exc)
-                if "CLOUDFLARE_CHALLENGE" in last_error or "WINDOW_CLOSED" in last_error:
+                if (
+                    "CLOUDFLARE_CHALLENGE" in last_error
+                    or "WINDOW_CLOSED" in last_error
+                    or "WebView 子进程无响应" in last_error
+                ):
                     raise
             time.sleep(0.5)
         raise RuntimeError(f"等待 WebView 加载 {site} 超时：{last_error}")
@@ -7290,8 +7743,9 @@ class PriceAppApi:
         if window and hasattr(window, "is_cancelled"):
             try:
                 return bool(window.is_cancelled())
-            except Exception:
-                return True
+            except Exception as exc:
+                LOGGER.debug("Unable to read login cancellation state; preserving window: %s", exc)
+                return False
         return False
 
     def _raise_if_browser_capture_cancelled(self, operation_id, site, window=None):
@@ -7527,11 +7981,16 @@ class PriceAppApi:
         deadline = time.time() + timeout
         while not done.is_set() and time.time() < deadline:
             self._raise_if_shutting_down()
-            if window is self.browser_window and self.browser_cancel_event.is_set():
-                raise RuntimeError("WINDOW_CLOSED: 登录窗口已关闭")
-            if self._detect_cloudflare_challenge(window):
-                raise RuntimeError("CLOUDFLARE_CHALLENGE: Cloudflare 验证未完成或当前环境不兼容")
-            done.wait(0.5)
+            if window is self.browser_window:
+                if self.browser_cancel_event.is_set():
+                    raise RuntimeError("WINDOW_CLOSED: 登录窗口已关闭")
+                try:
+                    remotely_cancelled = bool(window.is_cancelled())
+                except Exception:
+                    remotely_cancelled = False
+                if remotely_cancelled:
+                    raise RuntimeError("WINDOW_CLOSED: 登录窗口已关闭")
+            done.wait(min(0.5, max(0.0, deadline - time.time())))
         if not done.is_set():
             raise TimeoutError("抓取脚本超时，请确认站点窗口已完成登录且页面可访问")
         return holder.get("result")

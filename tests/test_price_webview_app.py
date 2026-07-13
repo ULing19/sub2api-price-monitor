@@ -237,6 +237,625 @@ class PriceAppLifecycleTests(unittest.TestCase):
         self.assertFalse(failure["auth_required"])
         self.assertEqual(window.url_probe_count, 0)
 
+    def test_responsive_webview_host_is_not_recycled_after_command_timeout(self):
+        manager = app.BrowserProcessManager(pathlib.Path(self.temporary_directory.name) / "profile")
+        manager.generation = 4
+        manager.process = mock.Mock(pid=1234)
+        manager.process.poll.return_value = None
+        with (
+            mock.patch.object(manager, "ensure_started"),
+            mock.patch.object(
+                manager,
+                "_request",
+                side_effect=[RuntimeError("timed out"), {"version": app.APP_VERSION}],
+            ),
+            mock.patch.object(manager, "mark_failed") as mark_failed,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "宿主仍在线，未执行重启"):
+                manager.call("get_current_url", "worker-0")
+        mark_failed.assert_not_called()
+
+    def test_concurrent_startup_timeout_preserves_host_marked_ready(self):
+        manager = app.BrowserProcessManager(pathlib.Path(self.temporary_directory.name) / "profile")
+        process = mock.Mock(pid=1234)
+        process.poll.return_value = None
+        manager.process = process
+        manager.generation = 1
+
+        monotonic_calls = 0
+
+        def advance_past_deadline():
+            nonlocal monotonic_calls
+            monotonic_calls += 1
+            if monotonic_calls == 1:
+                return 0.0
+            manager.ready_pid = process.pid
+            return 2.0
+
+        with (
+            mock.patch.object(app.time, "monotonic", side_effect=advance_past_deadline),
+            mock.patch.object(manager, "mark_failed") as mark_failed,
+            mock.patch.object(manager, "_request") as request,
+        ):
+            manager.ensure_started(timeout=1)
+
+        mark_failed.assert_not_called()
+        request.assert_not_called()
+        self.assertIs(manager.process, process)
+        self.assertEqual(manager.ready_pid, process.pid)
+
+    def test_active_login_prevents_worker_timeout_from_recycling_host(self):
+        manager = app.BrowserProcessManager(pathlib.Path(self.temporary_directory.name) / "profile")
+        manager.generation = 7
+        manager._set_login_protection(True)
+        manager.process = mock.Mock(pid=1234)
+        manager.process.poll.return_value = None
+        with (
+            mock.patch.object(manager, "ensure_started"),
+            mock.patch.object(manager, "_request", side_effect=RuntimeError("timed out")),
+            mock.patch.object(manager, "mark_failed") as mark_failed,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "登录窗口保持打开"):
+                manager.call("get_current_url", "worker-0")
+        mark_failed.assert_not_called()
+        self.assertTrue(manager._login_protection_active())
+
+    def test_login_activation_timeout_protects_responsive_host(self):
+        manager = app.BrowserProcessManager(pathlib.Path(self.temporary_directory.name) / "profile")
+        manager.generation = 8
+        manager.process = mock.Mock(pid=1234)
+        manager.process.poll.return_value = None
+        with (
+            mock.patch.object(manager, "ensure_started"),
+            mock.patch.object(
+                manager,
+                "_request",
+                side_effect=[RuntimeError("timed out"), {"version": app.APP_VERSION}],
+            ),
+            mock.patch.object(manager, "mark_failed") as mark_failed,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "登录窗口保持打开"):
+                manager.call("load_url", "login", {"url": "https://example.com"})
+
+        mark_failed.assert_not_called()
+        self.assertTrue(manager._login_protection_active(expected_generation=8))
+
+    def test_second_responsive_worker_timeout_schedules_recovery(self):
+        manager = app.BrowserProcessManager(pathlib.Path(self.temporary_directory.name) / "profile")
+        manager.generation = 5
+        manager.process = mock.Mock(pid=1234)
+        manager.process.poll.return_value = None
+        manager.command_failures[(5, "worker-0")] = 1
+        with (
+            mock.patch.object(manager, "ensure_started"),
+            mock.patch.object(
+                manager,
+                "_request",
+                side_effect=[RuntimeError("timed out"), {"version": app.APP_VERSION}],
+            ),
+            mock.patch.object(manager, "mark_failed", return_value=True) as mark_failed,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "连续超时，已安排重启"):
+                manager.call("load_url", "worker-0", {"url": "https://example.com"})
+        mark_failed.assert_called_once_with(
+            "load_url_repeated_failure",
+            expected_generation=5,
+        )
+
+    def test_login_window_commands_update_host_protection(self):
+        manager = app.BrowserProcessManager(pathlib.Path(self.temporary_directory.name) / "profile")
+        manager.generation = 2
+        with (
+            mock.patch.object(manager, "ensure_started"),
+            mock.patch.object(
+                manager,
+                "_request",
+                side_effect=[
+                    True,
+                    {
+                        "request_id": 1,
+                        "status": "pending",
+                        "activation_id": 1,
+                        "hidden": False,
+                    },
+                    {
+                        "request_id": 1,
+                        "status": "hidden",
+                        "activation_id": 1,
+                        "hidden": True,
+                    },
+                ],
+            ),
+        ):
+            manager.call("show", "login")
+            self.assertTrue(manager._login_protection_active())
+            manager.call("hide", "login")
+            self.assertTrue(manager._login_protection_active())
+            manager.call("get_hide_status", "login", {"request_id": 1})
+            self.assertFalse(manager._login_protection_active())
+
+        manager._set_login_protection(True)
+        with (
+            mock.patch.object(manager, "ensure_started"),
+            mock.patch.object(manager, "_request", return_value={
+                "cancelled": True,
+                "hidden": True,
+                "activation_id": 1,
+            }),
+        ):
+            state = manager.call("get_login_state", "login")
+            self.assertTrue(state["cancelled"])
+        self.assertFalse(manager._login_protection_active())
+
+    def test_login_state_probe_does_not_renew_host_protection(self):
+        manager = app.BrowserProcessManager(pathlib.Path(self.temporary_directory.name) / "profile")
+        manager.generation = 2
+        manager._set_login_protection(True)
+        deadline = manager.login_protection_deadline
+        with (
+            mock.patch.object(manager, "ensure_started"),
+            mock.patch.object(manager, "_request", return_value={
+                "cancelled": False,
+                "hidden": False,
+                "activation_id": 1,
+            }),
+        ):
+            manager.call("get_login_state", "login")
+
+        self.assertEqual(manager.login_protection_deadline, deadline)
+
+    def test_failed_login_hide_keeps_host_protected(self):
+        manager = app.BrowserProcessManager(pathlib.Path(self.temporary_directory.name) / "profile")
+        manager.generation = 3
+        manager.process = mock.Mock(pid=1234)
+        manager.process.poll.return_value = None
+        manager._set_login_protection(True)
+        with (
+            mock.patch.object(manager, "ensure_started"),
+            mock.patch.object(
+                manager,
+                "_request",
+                side_effect=[RuntimeError("timed out"), {"version": app.APP_VERSION}],
+            ),
+            mock.patch.object(manager, "mark_failed") as mark_failed,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "登录窗口保持打开"):
+                manager.call("hide", "login")
+
+        mark_failed.assert_not_called()
+        self.assertTrue(manager._login_protection_active(expected_generation=3))
+
+    def test_stale_login_response_cannot_clear_new_generation_protection(self):
+        manager = app.BrowserProcessManager(pathlib.Path(self.temporary_directory.name) / "profile")
+        manager.generation = 4
+        manager.process = mock.Mock(pid=1234)
+        manager.process.poll.return_value = None
+        manager._set_login_protection(True)
+
+        def replace_host(_payload, timeout):
+            manager.generation = 5
+            manager._set_login_protection(True)
+            return True
+
+        with (
+            mock.patch.object(manager, "ensure_started"),
+            mock.patch.object(manager, "_request", side_effect=replace_host),
+        ):
+            self.assertTrue(manager.call("hide", "login"))
+
+        self.assertTrue(manager._login_protection_active(expected_generation=5))
+
+    def test_old_hide_completion_cannot_clear_new_activation_protection(self):
+        manager = app.BrowserProcessManager(pathlib.Path(self.temporary_directory.name) / "profile")
+        manager.generation = 5
+        manager.login_active_activation_id = 2
+        manager._set_login_protection(True)
+        with (
+            mock.patch.object(manager, "ensure_started"),
+            mock.patch.object(manager, "_request", return_value={
+                "request_id": 1,
+                "status": "hidden",
+                "activation_id": 1,
+                "hidden": True,
+            }),
+        ):
+            manager.call("get_hide_status", "login", {"request_id": 1})
+
+        self.assertEqual(manager.login_active_activation_id, 2)
+        self.assertTrue(manager._login_protection_active(expected_generation=5))
+
+    def test_login_host_protection_expires_and_allows_recovery(self):
+        manager = app.BrowserProcessManager(pathlib.Path(self.temporary_directory.name) / "profile")
+        manager.generation = 6
+        manager.process = mock.Mock(pid=1234)
+        manager.process.poll.return_value = None
+        manager._set_login_protection(True)
+        manager.login_protection_deadline = time.monotonic() - 1
+
+        with (
+            mock.patch.object(manager, "ensure_started"),
+            mock.patch.object(manager, "_request", side_effect=RuntimeError("connection refused")),
+            mock.patch.object(manager, "mark_failed", return_value=True) as mark_failed,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "已安排重启"):
+                manager.call("get_current_url", "worker-0")
+
+        self.assertFalse(manager._login_protection_active())
+        mark_failed.assert_called_once_with(
+            "get_current_url_failed",
+            expected_generation=6,
+        )
+
+    def test_stale_webview_failure_cannot_recycle_new_generation(self):
+        manager = app.BrowserProcessManager(pathlib.Path(self.temporary_directory.name) / "profile")
+        manager.generation = 9
+        manager.process = mock.Mock(pid=1234)
+
+        recycled = manager.mark_failed("stale_request", expected_generation=8)
+
+        self.assertFalse(recycled)
+        self.assertEqual(manager.generation, 9)
+        self.assertIsNotNone(manager.process)
+
+    def test_unresponsive_unprotected_webview_host_is_scheduled_for_restart(self):
+        manager = app.BrowserProcessManager(pathlib.Path(self.temporary_directory.name) / "profile")
+        manager.generation = 3
+        manager.process = mock.Mock(pid=1234)
+        manager.process.poll.return_value = None
+        with (
+            mock.patch.object(manager, "ensure_started"),
+            mock.patch.object(manager, "_request", side_effect=RuntimeError("connection refused")),
+            mock.patch.object(manager, "mark_failed", return_value=True) as mark_failed,
+        ):
+            with self.assertRaisesRegex(RuntimeError, "已安排重启"):
+                manager.call("get_current_url", "worker-0")
+        mark_failed.assert_called_once_with(
+            "get_current_url_failed",
+            expected_generation=3,
+        )
+
+    def test_browser_host_serializes_commands_for_the_same_window(self):
+        class SerializedWindow(FakeBrowserWindow):
+            def __init__(self):
+                super().__init__()
+                self.entered = threading.Event()
+                self.release = threading.Event()
+                self.active_calls = 0
+                self.max_active_calls = 0
+                self.call_lock = threading.Lock()
+
+            def _enter(self):
+                with self.call_lock:
+                    self.active_calls += 1
+                    self.max_active_calls = max(self.max_active_calls, self.active_calls)
+
+            def _leave(self):
+                with self.call_lock:
+                    self.active_calls -= 1
+
+            def evaluate_js(self, script, callback=None):
+                self._enter()
+                self.entered.set()
+                self.release.wait(2)
+                if callback:
+                    callback("done")
+                self._leave()
+                return True
+
+            def get_current_url(self):
+                self._enter()
+                self._leave()
+                return "https://example.com"
+
+        runtime = app.BrowserHostRuntime(0, "token", self.temporary_directory.name)
+        login = SerializedWindow()
+        worker = FakeBrowserWindow()
+        runtime.attach_windows(login, [worker])
+        results = {}
+
+        evaluate_thread = threading.Thread(
+            target=lambda: results.setdefault("evaluate", runtime.execute({
+                "command": "evaluate_js",
+                "window": "login",
+                "payload": {"script": "1", "timeout": 2},
+            })),
+            daemon=True,
+        )
+        current_url_thread = threading.Thread(
+            target=lambda: results.setdefault("url", runtime.execute({
+                "command": "get_current_url",
+                "window": "login",
+            })),
+            daemon=True,
+        )
+        evaluate_thread.start()
+        self.assertTrue(login.entered.wait(1))
+        current_url_thread.start()
+        time.sleep(0.05)
+        self.assertTrue(current_url_thread.is_alive())
+        login.release.set()
+        evaluate_thread.join(2)
+        current_url_thread.join(2)
+
+        self.assertFalse(evaluate_thread.is_alive())
+        self.assertFalse(current_url_thread.is_alive())
+        self.assertEqual(login.max_active_calls, 1)
+        self.assertEqual(results["evaluate"], "done")
+        self.assertEqual(results["url"], "https://example.com")
+
+    def test_login_hide_returns_immediately_and_waits_for_active_evaluation(self):
+        class BlockingWindow(FakeBrowserWindow):
+            def __init__(self):
+                super().__init__()
+                self.evaluate_entered = threading.Event()
+                self.evaluate_release = threading.Event()
+                self.hidden = threading.Event()
+
+            def evaluate_js(self, script, callback=None):
+                self.evaluate_entered.set()
+                self.evaluate_release.wait(2)
+                if callback:
+                    callback("done")
+                return True
+
+            def hide(self):
+                super().hide()
+                self.hidden.set()
+
+        runtime = app.BrowserHostRuntime(0, "token", self.temporary_directory.name)
+        login = BlockingWindow()
+        runtime.attach_windows(login, [FakeBrowserWindow()])
+        evaluation = threading.Thread(
+            target=lambda: runtime.execute({
+                "command": "evaluate_js",
+                "window": "login",
+                "payload": {"script": "1", "timeout": 2},
+            }),
+            daemon=True,
+        )
+        evaluation.start()
+        self.assertTrue(login.evaluate_entered.wait(1))
+
+        started = time.monotonic()
+        self.assertTrue(runtime.execute({"command": "hide", "window": "login"}))
+        self.assertLess(time.monotonic() - started, 0.2)
+        self.assertTrue(runtime.execute({"command": "get_cancelled", "window": "login"}))
+        self.assertFalse(login.hidden.wait(0.05))
+
+        login.evaluate_release.set()
+        evaluation.join(2)
+        self.assertFalse(evaluation.is_alive())
+        self.assertTrue(login.hidden.wait(1))
+        self.assertEqual(login.hide_count, 1)
+
+    def test_stale_queued_hide_cannot_hide_a_new_login_navigation(self):
+        class BlockingWindow(FakeBrowserWindow):
+            def __init__(self):
+                super().__init__()
+                self.evaluate_entered = threading.Event()
+                self.evaluate_release = threading.Event()
+
+            def evaluate_js(self, script, callback=None):
+                self.evaluate_entered.set()
+                self.evaluate_release.wait(2)
+                if callback:
+                    callback("done")
+                return True
+
+        runtime = app.BrowserHostRuntime(0, "token", self.temporary_directory.name)
+        login = BlockingWindow()
+        runtime.attach_windows(login, [FakeBrowserWindow()])
+        evaluation = threading.Thread(
+            target=lambda: runtime.execute({
+                "command": "evaluate_js",
+                "window": "login",
+                "payload": {"script": "1", "timeout": 2},
+            }),
+            daemon=True,
+        )
+        navigation = threading.Thread(
+            target=lambda: runtime.execute({
+                "command": "load_url",
+                "window": "login",
+                "payload": {"url": "https://new-login.example"},
+            }),
+            daemon=True,
+        )
+        evaluation.start()
+        self.assertTrue(login.evaluate_entered.wait(1))
+        self.assertTrue(runtime.execute({"command": "hide", "window": "login"}))
+        navigation.start()
+        time.sleep(0.05)
+        login.evaluate_release.set()
+        evaluation.join(2)
+        navigation.join(2)
+        time.sleep(0.05)
+
+        self.assertFalse(evaluation.is_alive())
+        self.assertFalse(navigation.is_alive())
+        self.assertEqual(login.load_urls, ["https://new-login.example"])
+        self.assertEqual(login.hide_count, 0)
+        self.assertFalse(runtime.login_cancelled.is_set())
+
+    def test_stale_login_activation_cannot_overwrite_new_navigation(self):
+        class BlockingWindow(FakeBrowserWindow):
+            def __init__(self):
+                super().__init__()
+                self.evaluate_entered = threading.Event()
+                self.evaluate_release = threading.Event()
+
+            def evaluate_js(self, script, callback=None):
+                self.evaluate_entered.set()
+                self.evaluate_release.wait(2)
+                if callback:
+                    callback("done")
+                return True
+
+        runtime = app.BrowserHostRuntime(0, "token", self.temporary_directory.name)
+        login = BlockingWindow()
+        runtime.attach_windows(login, [FakeBrowserWindow()])
+        results = {}
+        evaluation = threading.Thread(
+            target=lambda: runtime.execute({
+                "command": "evaluate_js",
+                "window": "login",
+                "payload": {"script": "1", "timeout": 2},
+            }),
+            daemon=True,
+        )
+        old_navigation = threading.Thread(
+            target=lambda: results.setdefault("old", runtime.execute({
+                "command": "load_url",
+                "window": "login",
+                "payload": {
+                    "url": "https://old-login.example",
+                    "_activation_id": 1,
+                },
+            })),
+            daemon=True,
+        )
+        new_navigation = threading.Thread(
+            target=lambda: results.setdefault("new", runtime.execute({
+                "command": "load_url",
+                "window": "login",
+                "payload": {
+                    "url": "https://new-login.example",
+                    "_activation_id": 2,
+                },
+            })),
+            daemon=True,
+        )
+        evaluation.start()
+        self.assertTrue(login.evaluate_entered.wait(1))
+        old_navigation.start()
+        deadline = time.time() + 1
+        while runtime.login_latest_activation_id < 1 and time.time() < deadline:
+            time.sleep(0.01)
+        new_navigation.start()
+        deadline = time.time() + 1
+        while runtime.login_latest_activation_id < 2 and time.time() < deadline:
+            time.sleep(0.01)
+        login.evaluate_release.set()
+        evaluation.join(2)
+        old_navigation.join(2)
+        new_navigation.join(2)
+
+        self.assertEqual(login.load_urls, ["https://new-login.example"])
+        self.assertTrue(results["old"]["stale"])
+        self.assertTrue(results["new"])
+
+    def test_hide_that_overtakes_activation_cancels_that_activation(self):
+        runtime = app.BrowserHostRuntime(0, "token", self.temporary_directory.name)
+        login = FakeBrowserWindow()
+        runtime.attach_windows(login, [FakeBrowserWindow()])
+
+        runtime.execute({
+            "command": "hide",
+            "window": "login",
+            "payload": {"_activation_id": 1},
+        })
+        cancelled = runtime.execute({
+            "command": "load_url",
+            "window": "login",
+            "payload": {
+                "url": "https://cancelled.example",
+                "_activation_id": 1,
+            },
+        })
+        current = runtime.execute({
+            "command": "load_url",
+            "window": "login",
+            "payload": {
+                "url": "https://current.example",
+                "_activation_id": 2,
+            },
+        })
+
+        self.assertTrue(cancelled["stale"])
+        self.assertTrue(current)
+        self.assertEqual(login.load_urls, ["https://current.example"])
+        self.assertFalse(runtime.login_cancelled.is_set())
+
+    def test_async_login_hide_failure_is_reported_without_marking_hidden(self):
+        class FailingHideWindow(FakeBrowserWindow):
+            def hide(self):
+                raise RuntimeError("native hide failed")
+
+        runtime = app.BrowserHostRuntime(0, "token", self.temporary_directory.name)
+        login = FailingHideWindow()
+        runtime.attach_windows(login, [FakeBrowserWindow()])
+        runtime.execute({
+            "command": "load_url",
+            "window": "login",
+            "payload": {
+                "url": "https://example.com",
+                "_activation_id": 1,
+            },
+        })
+        scheduled = runtime.execute({
+            "command": "hide",
+            "window": "login",
+            "payload": {"_activation_id": 1},
+        })
+        deadline = time.time() + 1
+        status = scheduled
+        while status.get("status") == "pending" and time.time() < deadline:
+            time.sleep(0.01)
+            status = runtime.execute({
+                "command": "get_hide_status",
+                "window": "login",
+                "payload": {"request_id": scheduled["request_id"]},
+            })
+
+        self.assertEqual(status["status"], "failed")
+        self.assertIn("native hide failed", status["error"])
+        self.assertFalse(runtime._login_state()["hidden"])
+
+    def test_browser_host_window_lock_wait_is_bounded(self):
+        class BlockingWindow(FakeBrowserWindow):
+            def __init__(self):
+                super().__init__()
+                self.evaluate_entered = threading.Event()
+                self.evaluate_release = threading.Event()
+
+            def evaluate_js(self, script, callback=None):
+                self.evaluate_entered.set()
+                self.evaluate_release.wait(2)
+                if callback:
+                    callback("done")
+                return True
+
+        runtime = app.BrowserHostRuntime(0, "token", self.temporary_directory.name)
+        login = BlockingWindow()
+        runtime.attach_windows(login, [FakeBrowserWindow()])
+        evaluation = threading.Thread(
+            target=lambda: runtime.execute({
+                "command": "evaluate_js",
+                "window": "login",
+                "payload": {"script": "1", "timeout": 2},
+            }),
+            daemon=True,
+        )
+        evaluation.start()
+        self.assertTrue(login.evaluate_entered.wait(1))
+
+        started = time.monotonic()
+        with self.assertRaisesRegex(TimeoutError, "上一项操作"):
+            runtime.execute({
+                "command": "load_url",
+                "window": "login",
+                "payload": {
+                    "url": "https://example.com",
+                    "_activation_id": 1,
+                    "_lock_timeout": 0.05,
+                },
+            })
+        self.assertLess(time.monotonic() - started, 0.2)
+
+        login.evaluate_release.set()
+        evaluation.join(2)
+        self.assertFalse(evaluation.is_alive())
+
     def test_capture_failure_only_reauthorizes_explicit_auth_errors(self):
         api = self.new_api()
 
@@ -523,6 +1142,104 @@ class PriceAppLifecycleTests(unittest.TestCase):
         self.assertEqual(browser.show_count, 1)
         self.assertEqual(browser.restore_count, 1)
 
+    def test_relogin_reports_failure_when_show_and_restore_both_fail(self):
+        api = self.new_api()
+        browser = FakeBrowserWindow()
+        browser.show = mock.Mock(side_effect=RuntimeError("show timed out"))
+        browser.restore = mock.Mock(side_effect=RuntimeError("restore timed out"))
+        api.attach_browser_window(browser)
+
+        with mock.patch.object(api, "_start_credential_helper") as start_helper:
+            result = api.open_site("https://example.com")
+
+        self.assertFalse(result["ok"])
+        self.assertIn("无法显示", result["error"])
+        self.assertEqual(api.site, "")
+        self.assertEqual(browser.load_urls, ["https://example.com"])
+        start_helper.assert_not_called()
+
+    def test_transient_login_navigation_failure_preserves_remote_window_handle(self):
+        api = self.new_api()
+        browser = FakeBrowserWindow()
+        browser.load_url = mock.Mock(side_effect=RuntimeError("temporary IPC timeout"))
+        api.attach_browser_window(browser)
+
+        with self.assertRaisesRegex(RuntimeError, "temporary IPC timeout"):
+            api._ensure_browser_window("https://example.com", visible=True)
+
+        self.assertIs(api.browser_window, browser)
+        self.assertFalse(api.browser_cancel_event.is_set())
+
+    def test_transient_worker_navigation_failure_preserves_remote_window_handle(self):
+        api = self.new_api()
+        worker = FakeBrowserWindow()
+        worker.load_url = mock.Mock(side_effect=RuntimeError("temporary IPC timeout"))
+        api.attach_worker_window(worker, 0)
+
+        with self.assertRaisesRegex(RuntimeError, "temporary IPC timeout"):
+            api._ensure_worker_window(0, "https://example.com")
+
+        self.assertIs(api.worker_windows[0], worker)
+
+    def test_transient_hide_failure_preserves_remote_window_handle(self):
+        api = self.new_api()
+        browser = FakeBrowserWindow()
+        browser.hide = mock.Mock(side_effect=RuntimeError("temporary IPC timeout"))
+        api.attach_browser_window(browser)
+
+        api._hide_browser_window()
+
+        self.assertIs(api.browser_window, browser)
+
+    def test_webview_ready_probe_stops_after_first_host_timeout(self):
+        class TimeoutWindow:
+            def __init__(self):
+                self.url_probe_count = 0
+
+            def get_current_url(self):
+                self.url_probe_count += 1
+                raise RuntimeError("WebView 子进程无响应，登录窗口保持打开：timed out")
+
+            @staticmethod
+            def evaluate_js(script):
+                raise AssertionError("ready-state probe must not run after host timeout")
+
+        api = self.new_api()
+        window = TimeoutWindow()
+
+        with self.assertRaisesRegex(RuntimeError, "WebView 子进程无响应"):
+            api._wait_webview_ready(window, "https://example.com", timeout=10)
+        self.assertEqual(window.url_probe_count, 1)
+
+    def test_webview_ready_detects_remote_login_window_close(self):
+        api = self.new_api()
+        window = FakeCancellableBrowserWindow()
+        window.remote_cancelled = True
+        api.attach_browser_window(window)
+        api.site = "https://example.com"
+        api.browser_operation_id = 11
+
+        with self.assertRaisesRegex(RuntimeError, "WINDOW_CLOSED"):
+            api._wait_webview_ready(window, api.site, timeout=10)
+
+        self.assertEqual(window.url_probe_count, 0)
+
+    def test_auto_login_wait_detects_remote_login_window_close(self):
+        api = self.new_api()
+        window = FakeCancellableBrowserWindow()
+        window.remote_cancelled = True
+        api.attach_browser_window(window)
+        api.site = "https://example.com"
+        api.browser_operation_id = 12
+
+        with (
+            mock.patch.object(api, "_detect_cloudflare_challenge") as detect_challenge,
+            self.assertRaisesRegex(RuntimeError, "WINDOW_CLOSED"),
+        ):
+            api._wait_for_auto_login(api.site, window, timeout=10)
+
+        detect_challenge.assert_not_called()
+
     def test_closing_login_window_hides_it_for_reuse(self):
         api = self.new_api()
         browser = FakeBrowserWindow()
@@ -667,7 +1384,8 @@ class PriceAppLifecycleTests(unittest.TestCase):
             api.interactive_operation_lock.release()
 
         self.assertTrue(result["ok"])
-        self.assertTrue(result["hidden"])
+        self.assertFalse(result["hidden"])
+        self.assertTrue(result["hide_requested"])
         self.assertTrue(api.browser_cancel_event.is_set())
         deadline = time.monotonic() + 1
         while browser.hide_count == 0 and time.monotonic() < deadline:
@@ -813,6 +1531,48 @@ class PriceAppLifecycleTests(unittest.TestCase):
                 self.assertEqual(app.saved_sites_path().read_bytes(), sites_before)
                 self.assertEqual(app.load_latest_rows()[0]["group_id"], "old")
                 self.assertTrue(app.load_saved_sites()[0]["reauth_required"])
+
+    def test_cancel_probe_failure_does_not_assume_login_window_closed(self):
+        class FailingCancelWindow:
+            @staticmethod
+            def is_cancelled():
+                raise RuntimeError("temporary IPC timeout")
+
+        api = self.new_api()
+        api.site = "https://reauth.example"
+        api.browser_operation_id = 5
+
+        self.assertFalse(api._browser_capture_cancelled(
+            5,
+            "https://reauth.example",
+            FailingCancelWindow(),
+        ))
+
+    def test_async_capture_does_not_probe_webview_dom_while_js_is_running(self):
+        class PendingAsyncWindow:
+            def __init__(self):
+                self.cancel_checks = 0
+
+            @staticmethod
+            def evaluate_js(script, callback=None):
+                return True
+
+            def is_cancelled(self):
+                self.cancel_checks += 1
+                return False
+
+            @staticmethod
+            def destroy():
+                return None
+
+        api = self.new_api()
+        window = PendingAsyncWindow()
+        api.browser_window = window
+        with mock.patch.object(api, "_detect_cloudflare_challenge") as detect_challenge:
+            with self.assertRaisesRegex(TimeoutError, "抓取脚本超时"):
+                api._evaluate_async(window, "(() => true)()", timeout=0.02)
+        detect_challenge.assert_not_called()
+        self.assertGreaterEqual(window.cancel_checks, 1)
 
     def test_stale_browser_operation_result_is_not_committed(self):
         site = "https://stale-operation.example"
